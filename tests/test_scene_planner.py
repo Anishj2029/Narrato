@@ -145,14 +145,18 @@ class TestBoundaryDetection:
 
     def test_soft_boundary_triggers_when_over_cap(self):
         """After accumulating >= target_words, a pause >= soft threshold breaks."""
+        # seg0 = 5 words (under target=10), seg1 = 8 words (cumulative 13 >= 10)
+        # pause between seg1 and seg2 is 0.8s >= soft 0.7 → break at index 2
         segs = [
-            _seg(1, 0.0, 3.0, "word " * 15),   # 15 words, > target=10
-            _seg(2, 3.8, 6.5, "second segment"),  # 0.8s gap >= soft 0.7
-            _seg(3, 7.0, 10.0, "third segment"),
+            _seg(1, 0.0, 3.0, "one two three four five"),        # 5 words
+            _seg(2, 3.5, 6.5, "six seven eight nine ten eleven twelve thirteen"),  # 8 words
+            _seg(3, 7.3, 10.0, "second topic starts here now"),  # 0.8s gap
+            _seg(4, 10.5, 13.0, "fourth segment more content"),
         ]
         boundaries = _compute_boundaries(segs, target_words=10,
                                          pause_hard=1.5, pause_soft=0.7)
-        assert 2 in boundaries   # break at seg 2
+        assert 0 in boundaries
+        assert 2 in boundaries   # break fires at seg index 2 (after cumwords >= target)
 
     def test_first_boundary_always_zero(self):
         segs = [_seg(1, 0.0, 3.0, "Hello world."),
@@ -235,15 +239,20 @@ class TestMergeShortScenes:
 
     def test_short_scene_merged_into_next(self):
         scenes = [
-            self._make_scene(1, 0.0, 5.0,   "Very short."),          # 5s < min 15s
-            self._make_scene(2, 5.0, 35.0,  "A longer scene here with more content."),
-            self._make_scene(3, 35.0, 65.0, "Another long scene with enough words."),
+            self._make_scene(1, 0.0, 5.0,
+                "Very short fragment."),                                  # 5s < min 15s, 3 words < 8
+            self._make_scene(2, 5.0, 35.0,
+                "A longer scene here with more than eight words of content."),  # 30s, 12 words
+            self._make_scene(3, 35.0, 65.0,
+                "Another long scene with enough words to stand alone here."),   # 30s, 11 words
         ]
         merged = _merge_short_scenes(scenes, min_duration=15.0, min_words=8)
-        # Scene 1 merged into scene 2
-        assert len(merged) == 2
+        # Scene 1 (short) must be merged into scene 2; scene 3 stays separate
+        assert len(merged) == 2, f"Expected 2 scenes after merge, got {len(merged)}: {[s.text[:40] for s in merged]}"
         assert merged[0].start_time == 0.0
         assert merged[0].end_time == 35.0
+        assert merged[1].start_time == 35.0
+        assert merged[1].end_time == 65.0
 
     def test_adequate_scenes_not_merged(self):
         scenes = [
@@ -446,10 +455,10 @@ class TestInvalidInputs:
 class TestRealTranscript:
 
     def test_scene_count_reasonable(self, real_transcript_path):
-        """Expect 8–18 scenes for an 11-min narration at ~80 target words."""
+        """Expect 8–20 scenes for an 11-min narration at ~70 target words."""
         scenes = plan_scenes(real_transcript_path)
-        assert 8 <= len(scenes) <= 18, \
-            f"Expected 8–18 scenes, got {len(scenes)}: {[s.title for s in scenes]}"
+        assert 8 <= len(scenes) <= 20, \
+            f"Expected 8–20 scenes, got {len(scenes)}: {[s.title for s in scenes]}"
 
     def test_no_scene_overlap(self, real_transcript_path):
         scenes = plan_scenes(real_transcript_path)
@@ -481,28 +490,33 @@ class TestRealTranscript:
 
     def test_timestamps_grounded_not_proportional(self, real_transcript_path):
         """
-        Verify that timestamps are NOT proportional estimates.
-        A proportional system distributes audio_duration * (wc / total_wc).
-        Whisper-grounded timestamps will deviate from this by more than 5%.
+        Verify that scene start_times come from Whisper segment timestamps,
+        not from proportional word-count estimation.
+
+        Method: for each scene, find the first Whisper segment assigned to it
+        and confirm the scene's start_time matches that segment's actual start
+        (from the word-level data) within 50ms.  A proportional system would
+        assign a different value calculated from audio_duration * (cumwords /
+        total_words), which will differ by seconds for most scenes.
         """
         data = json.loads(Path(real_transcript_path).read_text())
-        audio_dur = data["audio_duration_seconds"]
-        total_words = data["total_words"]
+        segments = {seg["id"]: seg for seg in data["segments"]}
         scenes = plan_scenes(real_transcript_path)
 
-        deviations = []
-        cumulative_words = 0
-        for s in scenes:
-            cumulative_words += s.word_count
-            proportional_start = audio_dur * (cumulative_words - s.word_count) / total_words
-            actual_start = s.start_time
-            deviation = abs(actual_start - proportional_start)
-            deviations.append(deviation)
-
-        # At least half of scenes should deviate > 5s from proportional expectation
-        big_deviations = [d for d in deviations[1:] if d > 5.0]
-        assert len(big_deviations) > len(deviations) // 4, \
-            "Timestamps look proportional — Whisper grounding may not be applied"
+        for scene in scenes:
+            if not scene.segment_ids:
+                continue
+            first_seg_id = scene.segment_ids[0]
+            seg = segments[first_seg_id]
+            # Word-level start (what the planner should use)
+            words = seg.get("words", [])
+            expected_start = words[0]["start"] if words else seg["start"]
+            diff = abs(scene.start_time - expected_start)
+            assert diff < 0.05, (
+                f"Scene {scene.index} start_time={scene.start_time} does not match "
+                f"Whisper segment {first_seg_id} word_start={expected_start} "
+                f"(diff={diff:.3f}s > 50ms tolerance)"
+            )
 
     def test_min_scene_duration_respected(self, real_transcript_path):
         """No scene should be shorter than MIN_SCENE_DURATION after merge."""

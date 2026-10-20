@@ -141,6 +141,16 @@ def generate(backend_choice: str) -> Tuple[str, List]:
 
     images = [s.image_path for s in _SCENES if s.image_path and Path(s.image_path).exists()]
     status = f"✅ Generated {len(images)} / {len(_SCENES)} images  →  {out_dir}"
+    manifest_path = Path(out_dir) / "image_manifest.json"
+    if manifest_path.exists():
+        entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+        failures = [
+            f"Scene {entry['index']}: {entry['error']}"
+            for entry in entries
+            if entry.get("status") == "error"
+        ]
+        if failures:
+            status += "\n\nErrors:\n" + "\n".join(failures)
 
     # Re-export CSV with image paths
     to_csv(_SCENES, _TMP / "scenes_final.csv")
@@ -216,10 +226,10 @@ def build_ui() -> gr.Blocks:
         # ---- Tab 3 ----
         with gr.Tab("🖼️ Generate Images"):
             backend_radio = gr.Radio(
-                choices=["placeholder", "stability", "replicate"],
-                value="placeholder",
+                choices=["mock", "api", "local"],
+                value="mock",
                 label="Image backend",
-                info="Use 'placeholder' to test the pipeline without spending credits.",
+                info="Use 'mock' to test without API calls or local inference.",
             )
             gen_btn = gr.Button("Generate", variant="primary")
             gen_status = gr.Markdown()

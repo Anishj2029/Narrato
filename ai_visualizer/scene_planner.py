@@ -54,10 +54,10 @@ from typing import List, Dict, Any, Optional
 # ---------------------------------------------------------------------------
 # Configurable constants
 # ---------------------------------------------------------------------------
-TARGET_SCENE_WORDS: int = 80      # aim for scenes of roughly this many words
+TARGET_SCENE_WORDS: int = 70      # aim for scenes of roughly this many words
 MIN_SCENE_DURATION: float = 15.0  # merge scenes shorter than this (seconds)
-PAUSE_HARD_THRESHOLD: float = 1.5 # silence >= this ALWAYS breaks a scene
-PAUSE_SOFT_THRESHOLD: float = 0.7 # silence >= this breaks when over word cap
+PAUSE_HARD_THRESHOLD: float = 0.8 # silence >= this ALWAYS breaks a scene
+PAUSE_SOFT_THRESHOLD: float = 0.5 # silence >= this breaks when over word cap
 MIN_WORDS_FOR_SCENE: int = 8      # drop scenes with fewer words than this
 
 
@@ -269,59 +269,73 @@ def _merge_short_scenes(
     min_words: int = MIN_WORDS_FOR_SCENE,
 ) -> List[PlannedScene]:
     """
-    Merge scenes that are too short into the following scene.
-    The last scene is never merged away — it absorbs everything before it
-    that is too short.
+    Merge scenes that are too short into the following adequate scene.
+
+    Algorithm:
+    - Walk forward collecting scenes into a "pending" accumulator.
+    - As soon as the accumulator reaches min_duration AND min_words,
+      flush it as one scene and start a new accumulator.
+    - Any leftover accumulator at the end is flushed as-is (last scene
+      is never dropped, even if it doesn't meet the minimums).
     """
-    if len(scenes) <= 1:
+    if not scenes:
         return scenes
 
-    merged: List[PlannedScene] = []
-    pending: Optional[PlannedScene] = None
+    result: List[PlannedScene] = []
+
+    # Accumulator: list of scenes to be merged into one
+    acc: List[PlannedScene] = []
 
     for scene in scenes:
-        duration = scene.end_time - scene.start_time
-        if (duration < min_duration or scene.word_count < min_words) and pending is None:
-            # This short scene will be merged into the next one
-            pending = scene
-        elif pending is not None:
-            # Merge pending into current
-            combined_text = pending.text + " " + scene.text
-            combined_wc = pending.word_count + scene.word_count
-            combined_ids = pending.segment_ids + scene.segment_ids
-            merged_scene = PlannedScene(
-                index=0,  # re-indexed below
-                title=_make_title(combined_text),
-                text=combined_text,
-                start_time=pending.start_time,
-                end_time=scene.end_time,
-                word_count=combined_wc,
-                segment_ids=combined_ids,
-            )
-            merged.append(merged_scene)
-            pending = None
-        else:
-            merged.append(scene)
+        acc.append(scene)
+        acc_duration = acc[-1].end_time - acc[0].start_time
+        acc_words = sum(s.word_count for s in acc)
 
-    # If the last scene was pending, append it anyway (can't merge forward)
-    if pending is not None:
-        if merged:
-            # Merge backward into the last accepted scene
-            last = merged[-1]
-            last.text = last.text + " " + pending.text
-            last.word_count += pending.word_count
-            last.segment_ids += pending.segment_ids
-            last.end_time = pending.end_time
-            last.title = _make_title(last.text)
+        if acc_duration >= min_duration and acc_words >= min_words:
+            result.append(_fuse(acc))
+            acc = []
+
+    # Flush any remaining accumulator (always becomes a scene)
+    if acc:
+        if result:
+            # Merge the leftover tail into the last flushed scene
+            last = result[-1]
+            tail = _fuse(acc)
+            fused = PlannedScene(
+                index=0,
+                title=last.title,  # keep the leading scene's title
+                text=last.text + " " + tail.text,
+                start_time=last.start_time,
+                end_time=tail.end_time,
+                word_count=last.word_count + tail.word_count,
+                segment_ids=last.segment_ids + tail.segment_ids,
+            )
+            result[-1] = fused
         else:
-            merged.append(pending)
+            result.append(_fuse(acc))
 
     # Re-index
-    for i, s in enumerate(merged):
+    for i, s in enumerate(result):
         s.index = i + 1
         s.filename_suggestion = f"scene_{s.index:03d}.png"
 
-    return merged
+    return result
+
+
+def _fuse(acc: List[PlannedScene]) -> PlannedScene:
+    """Combine a list of PlannedScene objects into one."""
+    if len(acc) == 1:
+        return acc[0]
+    combined_text = " ".join(s.text for s in acc)
+    return PlannedScene(
+        index=0,
+        title=_make_title(acc[0].text),   # title from first scene in group
+        text=combined_text,
+        start_time=acc[0].start_time,
+        end_time=acc[-1].end_time,
+        word_count=sum(s.word_count for s in acc),
+        segment_ids=[sid for s in acc for sid in s.segment_ids],
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -7,9 +7,10 @@ Reads image prompts from scenes, queues generation jobs, saves numbered
 images (scene_001.png, scene_002.png …), and exports a final CSV.
 
 Supported backends (set IMAGE_BACKEND in .env):
-  - stability  : Stability AI (STABILITY_API_KEY)
-  - replicate  : Replicate (REPLICATE_API_TOKEN)
-  - placeholder: No API – saves a labeled placeholder image (safe default)
+  - mock : clearly labeled test image, no API or GPU
+  - api  : Gemini image generation using GEMINI_API_KEY
+  - local: ComfyUI local workflow and model
+  - placeholder, stability, replicate: legacy compatibility options
 
 The placeholder backend lets you test the entire pipeline end-to-end
 without spending any image credits.
@@ -18,7 +19,8 @@ without spending any image credits.
 from __future__ import annotations
 
 import os
-import time
+import json
+import tempfile
 from pathlib import Path
 from typing import List
 
@@ -176,52 +178,56 @@ def generate_images(
     ----------
     scenes       : list of Scene objects (should have image_prompt set)
     output_dir   : root output folder
-    backend      : 'placeholder' | 'stability' | 'replicate'
-                   Defaults to IMAGE_BACKEND env var, then 'placeholder'.
+    backend      : 'mock' | 'api' | 'local' (legacy options remain supported)
+                   Defaults to IMAGE_BACKEND env var, then 'mock'.
     delay_seconds: pause between API calls
     skip_existing: skip scenes whose image_path already points to a file
 
     Returns the same list with image_path fields populated.
     """
-    if backend is None:
-        backend = os.getenv("IMAGE_BACKEND", "placeholder").strip().lower()
+    from .image_runner import RunConfig, run_image_generation
 
-    if backend not in _BACKENDS:
-        raise ValueError(f"Unknown backend '{backend}'. Choose: {list(_BACKENDS)}")
+    base_dir = Path(output_dir)
+    out_dir = _output_dir(base_dir)
+    scene_plan = []
+    for scene in scenes:
+        scene_data = scene.to_dict()
+        scene_data["filename_suggestion"] = _image_filename(scene)
+        scene_plan.append(scene_data)
 
-    generate_fn = _BACKENDS[backend]
-    out_dir = _output_dir(Path(output_dir))
-    needs_delay = backend != "placeholder"
-
-    print(f"[ImageGen] Using backend: {backend}")
-    print(f"[ImageGen] Output dir:    {out_dir}")
-
-    for i, scene in enumerate(scenes):
-        out_path = out_dir / _image_filename(scene)
-
-        if skip_existing and out_path.exists():
-            print(f"  ✓ Scene {scene.index:03d} – skipped (exists)")
-            scene.image_path = str(out_path)
-            continue
-
-        if not scene.image_prompt:
-            print(f"  ⚠ Scene {scene.index:03d} – no image_prompt, skipping")
-            continue
-
+    base_dir.mkdir(parents=True, exist_ok=True)
+    temporary_plan = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix=".image-plan-",
+        dir=base_dir,
+        delete=False,
+    )
+    plan_path = Path(temporary_plan.name)
+    try:
+        with temporary_plan:
+            json.dump(scene_plan, temporary_plan, indent=2, ensure_ascii=False)
+        results = run_image_generation(RunConfig(
+            scene_plan_path=plan_path,
+            output_dir=out_dir,
+            manifest_path=base_dir / "image_manifest.json",
+            backend=backend,
+            delay_seconds=delay_seconds,
+            force=not skip_existing,
+        ))
+        results_by_index = {result.index: result for result in results}
+        for scene in scenes:
+            result = results_by_index[scene.index]
+            scene.image_path = (
+                result.image_path if result.status in {"ok", "skipped"} else ""
+            )
+        csv_path = to_csv(scenes, base_dir / "scenes_with_images.csv")
+        print(f"\n[ImageGen] Export → {csv_path}")
+    finally:
         try:
-            saved = generate_fn(scene, out_dir)
-            scene.image_path = str(saved)
-            print(f"  ✓ Scene {scene.index:03d} – saved → {saved.name}")
-        except Exception as exc:
-            print(f"  ✗ Scene {scene.index:03d} – ERROR: {exc}")
-            scene.image_path = ""
-
-        if needs_delay and i < len(scenes) - 1:
-            time.sleep(delay_seconds)
-
-    # Export updated CSV with image paths
-    csv_path = Path(output_dir) / "scenes_with_images.csv"
-    to_csv(scenes, csv_path)
-    print(f"\n[ImageGen] Export → {csv_path}")
+            plan_path.unlink()
+        except FileNotFoundError:
+            pass
 
     return scenes

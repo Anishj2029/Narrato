@@ -131,8 +131,8 @@ def cmd_generate_images(args: argparse.Namespace) -> None:
 
 
 def cmd_ui(args: argparse.Namespace) -> None:
-    from .ui import launch
-    print("🚀 Launching AI Visualizer UI…")
+    from .studio import launch
+    print("Launching Narrato Studio...")
     launch(share=args.share, port=args.port)
 
 

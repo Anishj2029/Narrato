@@ -42,14 +42,15 @@ import os
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from threading import Event
 from typing import Callable, Dict, List, Optional, Any
 
 from dotenv import load_dotenv
 
 from .image_backends import (
     BackendConfigurationError,
-    ComfyUIBackend,
+    ImageBackend,
     ImageOptions,
     MockBackend,
     create_backend,
@@ -365,6 +366,11 @@ class RunConfig:
     scene_indexes: Optional[List[int]] = None  # None = all scenes
     aspect_ratio: Optional[str] = "16:9"
     concurrency: int = 1
+    cancel_event: Optional[Event] = None
+    progress_callback: Optional[
+        Callable[[str, int, Optional[SceneResult], int, int], None]
+    ] = None
+    backend_instance: Optional[ImageBackend] = None
 
 
 def _backend_mock(scene: Dict[str, Any], out_dir: Path) -> Path:
@@ -383,6 +389,46 @@ def _backend_mock(scene: Dict[str, Any], out_dir: Path) -> Path:
 
 _DEFAULT_MOCK_BACKEND = _backend_mock
 BACKENDS["mock"] = _backend_mock
+
+
+def _validate_generated_image(path: Path, backend_name: str) -> None:
+    expected_formats = {
+        "api": ("JPEG", ".jpg"),
+        "local": ("PNG", ".png"),
+        "mock": ("PNG", ".png"),
+        "placeholder": ("PNG", ".png"),
+    }
+    expected = expected_formats.get(backend_name)
+    if expected is None:
+        return
+
+    expected_format, expected_extension = expected
+    if path.suffix.lower() != expected_extension:
+        raise ValueError(
+            f"Backend {backend_name!r} must save {expected_format} images "
+            f"with a {expected_extension} extension."
+        )
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            actual_format = image.format
+            image.verify()
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Backend {backend_name!r} produced an invalid image: {exc}") from exc
+    if actual_format != expected_format:
+        raise ValueError(
+            f"Backend {backend_name!r} must return {expected_format} image data; "
+            f"received {actual_format or 'unknown format'}."
+        )
+
+
+def _is_valid_generated_image(path: Path, backend_name: str) -> bool:
+    try:
+        _validate_generated_image(path, backend_name)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _generate_one(
@@ -423,8 +469,15 @@ def _generate_one(
             else:
                 saved_path = backend_fn(scene, output_dir)
                 model = ""
-            if not Path(saved_path).is_file():
+            saved_path = Path(saved_path)
+            if not saved_path.is_file():
                 raise RuntimeError(f"Backend reported success but image is missing: {saved_path}")
+            if saved_path.name != filename:
+                raise ValueError(
+                    f"Backend {backend_name!r} returned {saved_path.name!r}; "
+                    f"expected stable scene filename {filename!r}."
+                )
+            _validate_generated_image(saved_path, backend_name)
             return SceneResult(
                 index=index, title=scene["title"], filename=filename,
                 image_path=str(saved_path), prompt_used=prompt, status="ok",
@@ -504,11 +557,8 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
         )
 
     backend_fn = BACKENDS.get(backend_name)
-    backend_instance = None
-    if backend_name in {"api", "local"} and not cfg.dry_run:
-        backend_instance = create_backend(backend_name)
-        if isinstance(backend_instance, ComfyUIBackend) and not cfg.dry_run:
-            backend_instance.preflight()
+    output_extension = ".jpg" if backend_name == "api" else ".png"
+    backend_instance = cfg.backend_instance
 
     # ── Setup output dir ──────────────────────────────────────────────────
     if not cfg.dry_run:
@@ -531,9 +581,21 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
 
     # ── Process each scene ────────────────────────────────────────────────
     pending: List[tuple[Dict[str, Any], str, str]] = []
+    conflicts: List[SceneResult] = []
+    completed_count = 0
+
+    def notify_complete(result: SceneResult) -> None:
+        nonlocal completed_count
+        completed_count += 1
+        if cfg.progress_callback:
+            cfg.progress_callback(
+                "complete", result.index, result, completed_count, len(scenes)
+            )
+
     for i, scene in enumerate(scenes):
         idx = scene["index"]
-        fname = scene.get("filename_suggestion") or f"scene_{idx:03d}.png"
+        suggested_name = scene.get("filename_suggestion") or f"scene_{idx:03d}.png"
+        fname = Path(suggested_name).with_suffix(output_extension).name
         raw_prompt = scene.get("image_prompt", "").strip()
         clean = _clean_prompt(raw_prompt)
         out_path = cfg.output_dir / fname
@@ -551,12 +613,19 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 is_placeholder=backend_name in {"mock", "placeholder"},
                 model=getattr(backend_instance, "model_identifier", ""),
             ))
+            notify_complete(results[-1])
             continue
 
         # ── Skip if already done (resume) ────────────────────────────────
         prev = existing.get(idx)
         if (not cfg.force and prev and prev.status == "ok"
-                and prev.image_path and Path(prev.image_path).exists()):
+                and prev.backend == backend_name
+                and prev.filename == fname
+                and prev.is_placeholder == (backend_name in {"mock", "placeholder"})
+                and prev.image_path
+                and Path(prev.image_path).resolve() == out_path.resolve()
+                and Path(prev.image_path).is_file()
+                and _is_valid_generated_image(Path(prev.image_path), backend_name)):
             print(f"  Scene {idx:03d} - skipped (exists in manifest)")
             results.append(SceneResult(
                 index=idx, title=scene["title"], filename=fname,
@@ -565,9 +634,11 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 is_placeholder=prev.is_placeholder,
                 model=prev.model,
             ))
+            notify_complete(results[-1])
             continue
 
-        if not cfg.force and out_path.exists() and idx not in existing:
+        if (not cfg.force and out_path.exists() and idx not in existing
+                and backend_name not in {"api", "local"}):
             # File exists but manifest entry absent — treat as done
             print(f"  Scene {idx:03d} - skipped (file exists)")
             results.append(SceneResult(
@@ -579,40 +650,113 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
             save_manifest(results + [existing[k] for k in existing
                                      if k not in {r.index for r in results}],
                           cfg.manifest_path)
+            notify_complete(results[-1])
+            continue
+        if not cfg.force and out_path.exists() and backend_name in {"api", "local"}:
+            previous_backend = existing[idx].backend if idx in existing else "unknown"
+            conflicts.append(SceneResult(
+                index=idx,
+                title=scene["title"],
+                filename=fname,
+                image_path=str(out_path),
+                prompt_used=clean,
+                status="error",
+                error=(
+                    f"Output already exists at {out_path} (manifest backend: "
+                    f"{previous_backend}). Choose another output folder or explicitly "
+                    "enable replacement."
+                ),
+                backend=backend_name,
+                model="",
+            ))
             continue
         pending.append((scene, fname, clean))
 
-    if pending:
+    if pending or conflicts:
+        if backend_instance is None and backend_name in {"api", "local"}:
+            if pending:
+                backend_instance = create_backend(backend_name)
+
         def persist_result(result: SceneResult) -> None:
             results.append(result)
             print(
                 f"  [{len(results)}/{len(scenes)}] Scene {result.index:03d} - "
-                f"{'saved: ' + Path(result.image_path).name if result.status == 'ok' else 'ERROR: ' + result.error[:120]}"
+                f"{'saved: ' + Path(result.image_path).name if result.status == 'ok' else 'ERROR: ' + result.error}"
             )
             all_results = results + [
                 existing[key] for key in existing
                 if key not in {item.index for item in results}
             ]
             save_manifest(all_results, cfg.manifest_path)
+            notify_complete(result)
 
-        with ThreadPoolExecutor(max_workers=cfg.concurrency) as executor:
-            futures = {}
-            for position, (scene, filename, prompt) in enumerate(pending):
-                future = executor.submit(
-                    _generate_one,
-                    scene, filename, prompt, backend_name, backend_fn,
-                    backend_instance, cfg.output_dir, options, cfg.max_retries,
-                    cfg.retry_delay_seconds,
-                )
-                futures[future] = scene["index"]
-                if (
-                    backend_name not in {"mock", "placeholder"}
-                    and cfg.delay_seconds
-                    and position < len(pending) - 1
-                ):
-                    time.sleep(cfg.delay_seconds)
-            for future in as_completed(futures):
-                persist_result(future.result())
+        if pending:
+            with ThreadPoolExecutor(max_workers=cfg.concurrency) as executor:
+                futures = {}
+                next_job = 0
+
+                def submit_next() -> bool:
+                    nonlocal next_job
+                    if next_job >= len(pending):
+                        return False
+                    if (
+                        next_job > 0
+                        and backend_name not in {"mock", "placeholder"}
+                        and cfg.delay_seconds
+                    ):
+                        if cfg.cancel_event:
+                            if cfg.cancel_event.wait(cfg.delay_seconds):
+                                return False
+                        else:
+                            time.sleep(cfg.delay_seconds)
+                    scene, filename, prompt = pending[next_job]
+                    next_job += 1
+                    future = executor.submit(
+                        _generate_one,
+                        scene, filename, prompt, backend_name, backend_fn,
+                        backend_instance, cfg.output_dir, options, cfg.max_retries,
+                        cfg.retry_delay_seconds,
+                    )
+                    futures[future] = scene["index"]
+                    if cfg.progress_callback:
+                        cfg.progress_callback(
+                            "running", scene["index"], None, completed_count, len(scenes)
+                        )
+                    return True
+
+                for _ in range(min(cfg.concurrency, len(pending))):
+                    if not submit_next():
+                        break
+
+                while futures:
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        futures.pop(future)
+                        persist_result(future.result())
+                    while (
+                        not (cfg.cancel_event and cfg.cancel_event.is_set())
+                        and len(futures) < cfg.concurrency
+                        and submit_next()
+                    ):
+                        continue
+
+                if cfg.cancel_event and cfg.cancel_event.is_set():
+                    for scene, filename, prompt in pending[next_job:]:
+                        persist_result(SceneResult(
+                            index=scene["index"],
+                            title=scene["title"],
+                            filename=filename,
+                            image_path="",
+                            prompt_used=prompt,
+                            status="cancelled",
+                            error="Cancelled before this scene started.",
+                            backend=backend_name,
+                            is_placeholder=backend_name in {"mock", "placeholder"},
+                            model=getattr(backend_instance, "model_identifier", ""),
+                        ))
+
+        for conflict in conflicts:
+            persist_result(conflict)
 
     results.sort(key=lambda result: result.index)
 

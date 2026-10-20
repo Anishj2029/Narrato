@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import urljoin, urlparse
@@ -95,9 +98,89 @@ def _failure(backend: str, model: str, error: Exception | str) -> GenerationResu
     return GenerationResult(None, backend, model, False, str(error))
 
 
+def _redact_google_message(message: str, api_key: str) -> str:
+    safe_message = message
+    if api_key:
+        safe_message = safe_message.replace(api_key, "[REDACTED]")
+    safe_message = re.sub(
+        r"(?i)AIza[0-9A-Za-z_-]{20,}",
+        "[REDACTED]",
+        safe_message,
+    )
+    safe_message = re.sub(
+        r"(?i)(x-goog-api-key\s*[:=]\s*)[^\s,;\"']+",
+        r"\1[REDACTED]",
+        safe_message,
+    )
+    safe_message = re.sub(
+        r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+",
+        r"\1[REDACTED]",
+        safe_message,
+    )
+    safe_message = re.sub(
+        r"(?i)((?:api[_-]?key|key|access[_-]?token|token|authorization|password|secret)"
+        r"\s*[\"']?\s*[:=]\s*[\"']?)[^\"',\s}]+",
+        r"\1[REDACTED]",
+        safe_message,
+    )
+    return " ".join(safe_message.split())
+
+
+def _google_http_error(response: requests.Response, api_key: str) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        error = body if isinstance(body, dict) else {}
+
+    parts = [f"Gemini API HTTP {response.status_code}"]
+    code = error.get("code")
+    if isinstance(code, (int, str)) and not isinstance(code, bool):
+        parts.append(
+            "Google error code "
+            + _redact_google_message(str(code), api_key)
+        )
+    status = error.get("status")
+    if isinstance(status, str) and status.strip():
+        parts.append(
+            "status " + _redact_google_message(status.strip(), api_key)
+        )
+    message = error.get("message")
+    if isinstance(message, str) and message.strip():
+        parts.append(_redact_google_message(message, api_key))
+
+    details = error.get("details") or error.get("errors")
+    if details:
+        try:
+            serialized_details = json.dumps(
+                details, ensure_ascii=True, separators=(",", ":"), default=str
+            )
+        except (TypeError, ValueError):
+            serialized_details = str(details)
+        parts.append(
+            "details: " + _redact_google_message(serialized_details, api_key)[:3000]
+        )
+
+    if not (isinstance(message, str) and message.strip()) and not details:
+        try:
+            response_body = response.text
+        except (AttributeError, ValueError):
+            response_body = ""
+        if response_body:
+            parts.append(
+                "response: "
+                + _redact_google_message(response_body, api_key)[:3000]
+            )
+    return "; ".join(parts)[:4000]
+
+
 class MockBackend:
     name = "mock"
     model_identifier = "mock-labeled-png-v1"
+    output_extension = ".png"
 
     def generate(
         self,
@@ -138,6 +221,7 @@ class MockBackend:
 
 class GeminiApiBackend:
     name = "api"
+    output_extension = ".jpg"
 
     def __init__(
         self,
@@ -173,7 +257,7 @@ class GeminiApiBackend:
             if options.aspect_ratio:
                 payload["response_format"] = {
                     "type": "image",
-                    "mime_type": "image/png",
+                    "mime_type": "image/jpeg",
                     "aspect_ratio": options.aspect_ratio,
                 }
             response = requests.post(
@@ -185,11 +269,24 @@ class GeminiApiBackend:
                 json=payload,
                 timeout=self.timeout,
             )
+            if response.status_code >= 400:
+                return _failure(
+                    self.name,
+                    self.model_identifier,
+                    _google_http_error(response, self.api_key),
+                )
             response.raise_for_status()
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc
+            if not isinstance(data, dict):
+                raise ValueError("Gemini response JSON must be an object")
             image = data.get("output_image")
             if not isinstance(image, dict):
                 outputs = data.get("outputs", [])
+                if not isinstance(outputs, list):
+                    raise ValueError("Gemini response field 'outputs' must be an array")
                 image = next(
                     (
                         item for item in outputs
@@ -197,23 +294,54 @@ class GeminiApiBackend:
                     ),
                     None,
                 )
+            if image is None:
+                raise ValueError("Gemini response did not contain an image output")
+            if not isinstance(image, dict):
+                raise ValueError("Gemini image output must be an object")
+            mime_type = image.get("mime_type")
             encoded = image.get("data") if isinstance(image, dict) else None
             if not isinstance(encoded, str) or not encoded:
                 raise ValueError("Gemini response did not contain output_image.data")
-            image_bytes = base64.b64decode(encoded, validate=True)
+            try:
+                image_bytes = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("Gemini image data is not valid base64") from exc
             if not image_bytes:
                 raise ValueError("Gemini returned empty image data")
-            if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-                raise ValueError("Gemini response was not PNG image data")
+            from PIL import Image, UnidentifiedImageError
+
+            try:
+                with Image.open(BytesIO(image_bytes)) as returned_image:
+                    actual_format = returned_image.format
+                    returned_image.verify()
+            except (UnidentifiedImageError, OSError, ValueError) as exc:
+                raise ValueError("Gemini returned invalid image bytes") from exc
+            if actual_format != "JPEG":
+                raise ValueError(
+                    f"Gemini response contained {actual_format or 'unknown'} image bytes; "
+                    "expected JPEG."
+                )
+            if mime_type is not None and mime_type != "image/jpeg":
+                raise ValueError(
+                    f"Gemini declared image format {mime_type!r} but returned JPEG bytes; "
+                    "expected 'image/jpeg'."
+                )
+            if output_path.suffix.lower() != self.output_extension:
+                output_path = output_path.with_suffix(self.output_extension)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(image_bytes)
             return _success(output_path, self.name, self.model_identifier)
         except Exception as exc:
-            return _failure(self.name, self.model_identifier, exc)
+            return _failure(
+                self.name,
+                self.model_identifier,
+                _redact_google_message(str(exc), self.api_key),
+            )
 
 
 class ComfyUIBackend:
     name = "local"
+    output_extension = ".png"
     _PROMPT_TOKEN = "{{prompt}}"
 
     def __init__(
@@ -224,10 +352,16 @@ class ComfyUIBackend:
         timeout: Optional[float] = None,
         poll_interval: Optional[float] = None,
     ) -> None:
-        self.base_url = (base_url or os.getenv("COMFYUI_BASE_URL", "http://127.0.0.1:8188")).rstrip("/") + "/"
+        configured_url = (
+            base_url
+            or os.getenv("COMFYUI_URL")
+            or os.getenv("COMFYUI_BASE_URL")
+            or "http://127.0.0.1:8188"
+        )
+        self.base_url = configured_url.rstrip("/") + "/"
         parsed_url = urlparse(self.base_url)
         if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-            raise BackendConfigurationError("COMFYUI_BASE_URL must be a valid HTTP(S) URL.")
+            raise BackendConfigurationError("COMFYUI_URL must be a valid HTTP(S) URL.")
         configured_workflow = workflow_path or os.getenv("COMFYUI_WORKFLOW", "")
         if not configured_workflow:
             raise BackendConfigurationError(
@@ -328,7 +462,9 @@ class ComfyUIBackend:
                 model_names.append(model)
             self.model_identifier = ", ".join(model_names)
             self._preflight_done = True
-        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        except requests.RequestException as exc:
+            raise RuntimeError(f"ComfyUI request failed during preflight: {exc}") from exc
+        except (ValueError, KeyError, TypeError) as exc:
             raise BackendConfigurationError(f"ComfyUI preflight failed: {exc}") from exc
 
     def generate(

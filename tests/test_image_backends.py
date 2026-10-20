@@ -20,17 +20,26 @@ from ai_visualizer.image_backends import (
 
 
 class _Response:
-    def __init__(self, data: Any = None, content: bytes = b"", status: int = 200):
+    def __init__(
+        self,
+        data: Any = None,
+        content: bytes = b"",
+        status: int = 200,
+        json_error: Exception | None = None,
+    ):
         self._data = data
         self.content = content
         self.status_code = status
+        self.json_error = json_error
 
     def json(self):
+        if self.json_error:
+            raise self.json_error
         return self._data
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise requests.HTTPError(f"HTTP {self.status_code}")
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
 
 def _png_bytes() -> bytes:
@@ -39,6 +48,15 @@ def _png_bytes() -> bytes:
 
     buffer = BytesIO()
     Image.new("RGB", (2, 2), (12, 34, 56)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _jpeg_bytes() -> bytes:
+    from io import BytesIO
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), (12, 34, 56)).save(buffer, format="JPEG")
     return buffer.getvalue()
 
 
@@ -86,23 +104,24 @@ def test_mock_backend_creates_distinguishable_png(tmp_path):
 
 
 def test_api_backend_saves_interaction_image_bytes(tmp_path):
-    image_bytes = _png_bytes()
-    response = _Response({"outputs": [{
+    image_bytes = _jpeg_bytes()
+    response = _Response({"output_image": {
         "type": "image",
-        "mime_type": "image/png",
+        "mime_type": "image/jpeg",
         "data": base64.b64encode(image_bytes).decode("ascii"),
-    }]})
+    }})
     with patch("ai_visualizer.image_backends.requests.post", return_value=response) as post:
         backend = GeminiApiBackend(api_key="test-key", model="test-image-model")
         path = tmp_path / "scene_001.png"
         result = backend.generate("1", "A cinematic lake", path, ImageOptions("16:9"))
 
     assert result.success
-    assert result.output_path == path
+    assert result.output_path == tmp_path / "scene_001.jpg"
     assert result.backend_name == "api"
     assert result.model_identifier == "test-image-model"
-    assert path.read_bytes() == image_bytes
+    assert result.output_path.read_bytes() == image_bytes
     assert post.call_args.kwargs["headers"]["x-goog-api-key"] == "test-key"
+    assert post.call_args.kwargs["json"]["response_format"]["mime_type"] == "image/jpeg"
     assert post.call_args.kwargs["json"]["response_format"]["aspect_ratio"] == "16:9"
 
 
@@ -131,6 +150,43 @@ def test_api_backend_reports_http_failure(tmp_path):
     assert "429" in result.error
 
 
+def test_api_backend_reports_google_http_400_json_error_without_credentials(tmp_path):
+    secret = "DO_NOT_LOG_THIS_TEST_KEY"
+    response = _Response(
+        {
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": f"Invalid request for key {secret}",
+            }
+        },
+        status=400,
+    )
+    with patch("ai_visualizer.image_backends.requests.post", return_value=response) as post:
+        result = GeminiApiBackend(api_key=secret).generate(
+            "1", "A scene", tmp_path / "scene_001.png", ImageOptions()
+        )
+
+    assert not result.success
+    assert "400" in result.error
+    assert "INVALID_ARGUMENT" in result.error
+    assert "Invalid request for key [REDACTED]" in result.error
+    assert secret not in result.error
+    assert secret not in repr(result)
+    assert post.call_args.kwargs["headers"]["x-goog-api-key"] == secret
+    assert not (tmp_path / "scene_001.png").exists()
+
+
+def test_api_backend_reports_http_error_without_json_body(tmp_path):
+    response = _Response(status=400, json_error=ValueError("not JSON"))
+    with patch("ai_visualizer.image_backends.requests.post", return_value=response):
+        result = GeminiApiBackend(api_key="test-key").generate(
+            "1", "A scene", tmp_path / "scene_001.png", ImageOptions()
+        )
+    assert not result.success
+    assert result.error == "Gemini API HTTP 400"
+
+
 def test_api_backend_reports_timeout(tmp_path):
     with patch(
         "ai_visualizer.image_backends.requests.post",
@@ -141,6 +197,70 @@ def test_api_backend_reports_timeout(tmp_path):
         )
     assert not result.success
     assert "timed out" in result.error
+
+
+def test_api_backend_reports_malformed_success_json(tmp_path):
+    response = _Response(json_error=json.JSONDecodeError("invalid", "nope", 0))
+    with patch("ai_visualizer.image_backends.requests.post", return_value=response):
+        result = GeminiApiBackend(api_key="test-key").generate(
+            "1", "A scene", tmp_path / "scene_001.png", ImageOptions()
+        )
+    assert not result.success
+    assert "invalid JSON" in result.error
+    assert not (tmp_path / "scene_001.png").exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_error"),
+    [
+        (["not", "an", "object"], "must be an object"),
+        ({"outputs": {}}, "must be an array"),
+        ({"output_image": {"data": "not-base64!"}}, "not valid base64"),
+        (
+            {"output_image": {"data": base64.b64encode(b"\x00not an image").decode("ascii")}},
+            "invalid image bytes",
+        ),
+    ],
+)
+def test_api_backend_reports_malformed_image_responses(
+    tmp_path, body, expected_error
+):
+    with patch("ai_visualizer.image_backends.requests.post", return_value=_Response(body)):
+        result = GeminiApiBackend(api_key="test-key").generate(
+            "1", "A scene", tmp_path / "scene_001.png", ImageOptions()
+        )
+    assert not result.success
+    assert expected_error in result.error
+    assert not (tmp_path / "scene_001.jpg").exists()
+
+
+def test_api_backend_rejects_declared_jpeg_with_png_bytes(tmp_path):
+    png = _png_bytes()
+    response = _Response({"output_image": {
+        "mime_type": "image/jpeg",
+        "data": base64.b64encode(png).decode("ascii"),
+    }})
+    with patch("ai_visualizer.image_backends.requests.post", return_value=response):
+        result = GeminiApiBackend(api_key="test-key").generate(
+            "1", "A scene", tmp_path / "scene_001.png", ImageOptions()
+        )
+    assert not result.success
+    assert "contained PNG image bytes" in result.error
+    assert not (tmp_path / "scene_001.jpg").exists()
+
+
+def test_api_backend_rejects_unsupported_declared_format(tmp_path):
+    response = _Response({"output_image": {
+        "mime_type": "image/webp",
+        "data": base64.b64encode(_jpeg_bytes()).decode("ascii"),
+    }})
+    with patch("ai_visualizer.image_backends.requests.post", return_value=response):
+        result = GeminiApiBackend(api_key="test-key").generate(
+            "1", "A scene", tmp_path / "scene_001.png", ImageOptions()
+        )
+    assert not result.success
+    assert "declared image format 'image/webp'" in result.error
+    assert not (tmp_path / "scene_001.jpg").exists()
 
 
 def test_unsupported_aspect_ratio_is_explicit_and_makes_no_request(tmp_path):
@@ -280,3 +400,20 @@ def test_local_backend_requires_workflow_configuration(monkeypatch):
     monkeypatch.delenv("COMFYUI_WORKFLOW", raising=False)
     with pytest.raises(BackendConfigurationError, match="COMFYUI_WORKFLOW"):
         create_backend("local")
+
+
+def test_local_backend_prefers_comfyui_url_and_supports_legacy_name(
+    monkeypatch, tmp_path
+):
+    workflow_path = _workflow(tmp_path / "workflow.json")
+    monkeypatch.setenv("COMFYUI_WORKFLOW", str(workflow_path))
+    monkeypatch.setenv("COMFYUI_BASE_URL", "http://legacy:8188")
+    monkeypatch.setenv("COMFYUI_URL", "http://preferred:8188")
+
+    backend = create_backend("local")
+
+    assert isinstance(backend, ComfyUIBackend)
+    assert backend.base_url == "http://preferred:8188/"
+
+    monkeypatch.delenv("COMFYUI_URL")
+    assert create_backend("local").base_url == "http://legacy:8188/"

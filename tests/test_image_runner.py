@@ -18,7 +18,13 @@ from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
+from ai_visualizer.image_backends import (
+    ComfyUIBackend,
+    GenerationResult,
+    GeminiApiBackend,
+)
 from ai_visualizer.image_runner import (
     BACKENDS,
     RunConfig,
@@ -298,7 +304,124 @@ class TestSuccessfulGeneration:
         assert manifest[0]["path"] == manifest[0]["image_path"]
         assert manifest[0]["model"] == "mock-labeled-png-v1"
 
-    def test_resume_keeps_original_backend_and_model(self, tmp_path):
+    def test_api_jpeg_extension_is_used_in_manifest(self, tmp_path, monkeypatch):
+        import base64
+        from io import BytesIO
+        from PIL import Image
+
+        image_buffer = BytesIO()
+        Image.new("RGB", (2, 2), (10, 20, 30)).save(image_buffer, format="JPEG")
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({
+            "output_image": {
+                "mime_type": "image/jpeg",
+                "data": base64.b64encode(image_buffer.getvalue()).decode("ascii"),
+            }
+        }).encode("utf-8")
+        monkeypatch.setattr(
+            "ai_visualizer.image_runner.create_backend",
+            lambda name: GeminiApiBackend(api_key="test-key"),
+        )
+        monkeypatch.setattr(
+            "ai_visualizer.image_backends.requests.post",
+            lambda *args, **kwargs: response,
+        )
+
+        plan = tmp_path / "plan.json"
+        _write_plan([_make_scene()], plan)
+        image_dir = tmp_path / "images"
+        manifest_path = tmp_path / "manifest.json"
+        results = run_image_generation(RunConfig(
+            scene_plan_path=plan,
+            output_dir=image_dir,
+            manifest_path=manifest_path,
+            backend="api",
+            max_retries=0,
+            delay_seconds=0,
+        ))
+
+        manifest_entry = json.loads(manifest_path.read_text(encoding="utf-8"))[0]
+        assert results[0].status == "ok"
+        assert results[0].filename == "scene_001.jpg"
+        assert Path(results[0].image_path).suffix == ".jpg"
+        assert manifest_entry["filename"] == "scene_001.jpg"
+        assert Path(manifest_entry["path"]).suffix == ".jpg"
+        assert (image_dir / "scene_001.jpg").exists()
+        assert not (image_dir / "scene_001.png").exists()
+
+    def test_local_png_is_validated_and_manifest_uses_png_path(self, tmp_path, monkeypatch):
+        from PIL import Image
+
+        class LocalBackend:
+            model_identifier = "local-test-model"
+
+            def generate(self, scene_id, image_prompt, output_path, options):
+                Image.new("RGB", (2, 2), (20, 30, 40)).save(output_path, format="PNG")
+                return GenerationResult(
+                    output_path, "local", self.model_identifier, True
+                )
+
+        monkeypatch.setattr(
+            "ai_visualizer.image_runner.create_backend",
+            lambda name: LocalBackend(),
+        )
+        plan = tmp_path / "plan.json"
+        _write_plan([_make_scene()], plan)
+        manifest_path = tmp_path / "manifest.json"
+        results = run_image_generation(RunConfig(
+            scene_plan_path=plan,
+            output_dir=tmp_path / "images",
+            manifest_path=manifest_path,
+            backend="local",
+            max_retries=0,
+            delay_seconds=0,
+        ))
+
+        entry = json.loads(manifest_path.read_text(encoding="utf-8"))[0]
+        assert results[0].status == "ok"
+        assert results[0].filename == "scene_001.png"
+        assert entry["backend"] == "local"
+        assert entry["model"] == "local-test-model"
+        assert Path(entry["path"]).suffix == ".png"
+
+    def test_local_backend_format_mismatch_is_failure_not_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        from PIL import Image
+
+        class WrongFormatBackend:
+            model_identifier = "local-test-model"
+
+            def generate(self, scene_id, image_prompt, output_path, options):
+                Image.new("RGB", (2, 2), (20, 30, 40)).save(output_path, format="JPEG")
+                return GenerationResult(
+                    output_path, "local", self.model_identifier, True
+                )
+
+        monkeypatch.setattr(
+            "ai_visualizer.image_runner.create_backend",
+            lambda name: WrongFormatBackend(),
+        )
+        plan = tmp_path / "plan.json"
+        _write_plan([_make_scene()], plan)
+        manifest_path = tmp_path / "manifest.json"
+        results = run_image_generation(RunConfig(
+            scene_plan_path=plan,
+            output_dir=tmp_path / "images",
+            manifest_path=manifest_path,
+            backend="local",
+            max_retries=0,
+            delay_seconds=0,
+        ))
+
+        manifest_entry = json.loads(manifest_path.read_text(encoding="utf-8"))[0]
+        assert results[0].status == "error"
+        assert "must return PNG image data" in results[0].error
+        assert manifest_entry["error"] == results[0].error
+        assert manifest_entry["backend"] == "local"
+
+    def test_resume_does_not_reuse_image_from_another_backend(self, tmp_path):
         image_dir = tmp_path / "img"
         image_dir.mkdir()
         image_path = image_dir / "scene_001.png"
@@ -320,9 +443,10 @@ class TestSuccessfulGeneration:
                 backend="mock",
             ))
 
-        assert results[0].status == "skipped"
-        assert results[0].backend == "api"
-        assert results[0].model == "prior-model"
+        assert results[0].status == "ok"
+        assert results[0].backend == "mock"
+        assert results[0].is_placeholder
+        assert image_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
     def test_result_image_paths_exist(self, tmp_path):
         scenes = [_make_scene(i, start_time=i*30.0, end_time=i*30.0+25.0)
@@ -403,6 +527,112 @@ class TestFailureHandling:
         manifest = json.loads((tmp_path / "manifest.json").read_text())
         assert manifest[0]["error"] != ""
 
+    def test_comfyui_unavailable_is_retried_and_recorded_without_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        workflow_path = tmp_path / "workflow.json"
+        workflow_path.write_text(json.dumps({
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": "test.safetensors"},
+            },
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}"}},
+            "3": {"class_type": "SaveImage", "inputs": {}},
+        }), encoding="utf-8")
+        backend = ComfyUIBackend(
+            base_url="http://127.0.0.1:8188",
+            workflow_path=workflow_path,
+        )
+        monkeypatch.setattr(
+            "ai_visualizer.image_runner.create_backend",
+            lambda name: backend,
+        )
+        request_count = {"count": 0}
+
+        def unavailable(*args, **kwargs):
+            request_count["count"] += 1
+            raise requests.ConnectionError("ComfyUI is not reachable")
+
+        monkeypatch.setattr("ai_visualizer.image_backends.requests.get", unavailable)
+        with patch("ai_visualizer.image_backends.requests.post") as post:
+            plan = tmp_path / "plan.json"
+            _write_plan([_make_scene()], plan)
+            manifest_path = tmp_path / "manifest.json"
+            results = run_image_generation(RunConfig(
+                scene_plan_path=plan,
+                output_dir=tmp_path / "images",
+                manifest_path=manifest_path,
+                backend="local",
+                max_retries=1,
+                retry_delay_seconds=0,
+                delay_seconds=0,
+            ))
+
+        manifest_entry = json.loads(manifest_path.read_text(encoding="utf-8"))[0]
+        assert request_count["count"] == 2
+        assert results[0].status == "error"
+        assert "ComfyUI request failed during preflight" in results[0].error
+        assert manifest_entry["error"] == results[0].error
+        assert manifest_entry["backend"] == "local"
+        post.assert_not_called()
+
+    def test_google_http_400_details_reach_manifest_and_redact_credentials(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        api_key = "TEST_API_KEY_NEVER_LOG"
+        access_token = "TEST_ACCESS_TOKEN_NEVER_LOG"
+        response = requests.Response()
+        response.status_code = 400
+        response.encoding = "utf-8"
+        response._content = json.dumps({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": f"Invalid request parameter; key={api_key}",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "INVALID_ARGUMENT",
+                    "metadata": {
+                        "field": "response_format",
+                        "access_token": access_token,
+                    },
+                }],
+            }
+        }).encode("utf-8")
+        monkeypatch.setattr(
+            "ai_visualizer.image_runner.create_backend",
+            lambda name: GeminiApiBackend(api_key=api_key),
+        )
+        monkeypatch.setattr(
+            "ai_visualizer.image_backends.requests.post",
+            lambda *args, **kwargs: response,
+        )
+
+        plan_path = tmp_path / "plan.json"
+        _write_plan([_make_scene()], plan_path)
+        manifest_path = tmp_path / "manifest.json"
+        results = run_image_generation(RunConfig(
+            scene_plan_path=plan_path,
+            output_dir=tmp_path / "images",
+            manifest_path=manifest_path,
+            backend="api",
+            max_retries=0,
+            delay_seconds=0,
+        ))
+
+        error = results[0].error
+        manifest_error = json.loads(manifest_path.read_text(encoding="utf-8"))[0]["error"]
+        console_output = capsys.readouterr().out
+        for diagnostic in (error, manifest_error, console_output):
+            assert "400" in diagnostic
+            assert "INVALID_ARGUMENT" in diagnostic
+            assert "Invalid request parameter" in diagnostic
+            assert "[REDACTED]" in diagnostic
+            assert "response_format" in diagnostic
+            assert api_key not in diagnostic
+            assert access_token not in diagnostic
+        assert manifest_error == error
+
     def test_one_failure_does_not_abort_other_scenes(self, tmp_path):
         call_count = {"n": 0}
 
@@ -440,6 +670,53 @@ class TestFailureHandling:
             results = run_image_generation(cfg)
 
         assert results[0].status == "error"
+
+    def test_existing_other_backend_output_is_not_overwritten(self, tmp_path, monkeypatch):
+        from PIL import Image
+
+        output_dir = tmp_path / "images"
+        output_dir.mkdir()
+        existing_path = output_dir / "scene_001.png"
+        Image.new("RGB", (2, 2), (30, 40, 50)).save(existing_path, format="PNG")
+        original_bytes = existing_path.read_bytes()
+        manifest_path = tmp_path / "manifest.json"
+        save_manifest([SceneResult(
+            index=1,
+            title="Existing",
+            filename=existing_path.name,
+            image_path=str(existing_path),
+            prompt_used="existing",
+            status="ok",
+            backend="mock",
+            is_placeholder=True,
+        )], manifest_path)
+
+        class UnexpectedBackend:
+            model_identifier = "local-model"
+
+            def generate(self, *args, **kwargs):
+                raise AssertionError("conflicting output must not be overwritten")
+
+        monkeypatch.setattr(
+            "ai_visualizer.image_runner.create_backend",
+            lambda name: UnexpectedBackend(),
+        )
+        plan = tmp_path / "plan.json"
+        _write_plan([_make_scene()], plan)
+        results = run_image_generation(RunConfig(
+            scene_plan_path=plan,
+            output_dir=output_dir,
+            manifest_path=manifest_path,
+            backend="local",
+            delay_seconds=0,
+        ))
+
+        assert results[0].status == "error"
+        assert "explicitly enable replacement" in results[0].error
+        assert existing_path.read_bytes() == original_bytes
+        manifest_entry = json.loads(manifest_path.read_text(encoding="utf-8"))[0]
+        assert manifest_entry["backend"] == "local"
+        assert manifest_entry["status"] == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +767,46 @@ class TestRetryBehaviour:
 
         assert results[0].status == "error"
 
+    def test_cancellation_stops_scheduling_remaining_scenes(self, tmp_path):
+        from threading import Event
+
+        call_log = []
+        cancel_event = Event()
+
+        def backend(scene, out_dir):
+            call_log.append(scene["index"])
+            return _fake_backend(scene, out_dir)
+
+        def progress(event_name, index, result, completed, total):
+            if event_name == "running" and index == 1:
+                cancel_event.set()
+
+        scenes = [
+            _make_scene(i, start_time=(i - 1) * 30, end_time=i * 30)
+            for i in range(1, 4)
+        ]
+        plan = tmp_path / "plan.json"
+        _write_plan(scenes, plan)
+        with patch.dict(BACKENDS, {"cancellable": backend}):
+            results = run_image_generation(RunConfig(
+                scene_plan_path=plan,
+                output_dir=tmp_path / "images",
+                manifest_path=tmp_path / "manifest.json",
+                backend="cancellable",
+                concurrency=1,
+                delay_seconds=0,
+                max_retries=0,
+                cancel_event=cancel_event,
+                progress_callback=progress,
+            ))
+
+        assert call_log == [1]
+        assert {result.index: result.status for result in results} == {
+            1: "ok",
+            2: "cancelled",
+            3: "cancelled",
+        }
+
 
 # ---------------------------------------------------------------------------
 # Resume / skip-existing behaviour
@@ -500,15 +817,15 @@ class TestResumeBehaviour:
     def test_existing_ok_scene_is_skipped(self, tmp_path):
         img_dir = tmp_path / "img"
         img_dir.mkdir()
-        # Pre-create the image file
-        (img_dir / "scene_001.png").write_bytes(b"fake")
+        # Resume only treats an existing, validated image as successful.
+        _fake_backend(_make_scene(), img_dir)
 
         # Pre-populate manifest with a successful entry
         manifest_path = tmp_path / "manifest.json"
         existing = [SceneResult(
             index=1, title="T", filename="scene_001.png",
             image_path=str(img_dir / "scene_001.png"),
-            prompt_used="test", status="ok", backend="mock",
+            prompt_used="test", status="ok", backend="counting",
         )]
         save_manifest(existing, manifest_path)
 
@@ -573,10 +890,10 @@ class TestResumeBehaviour:
         prior = [
             SceneResult(index=1, title="S1", filename="scene_001.png",
                         image_path=str(img_dir/"scene_001.png"),
-                        prompt_used="p1", status="ok", backend="mock"),
+                        prompt_used="p1", status="ok", backend="logging"),
             SceneResult(index=2, title="S2", filename="scene_002.png",
                         image_path="", prompt_used="p2",
-                        status="error", error="timeout", backend="mock"),
+                        status="error", error="timeout", backend="logging"),
         ]
         save_manifest(prior, manifest_path)
 

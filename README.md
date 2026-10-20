@@ -8,7 +8,7 @@ Automate scenes, timestamps, and images from a narration script and audio file.
 |-------|-------------|
 | 1 | Parse TXT/MD script + MP3/WAV audio → scenes CSV & JSON with real timestamps |
 | 2 | Gemini API enriches each scene with a cinematic image prompt |
-| 3 | Queue image jobs → numbered PNGs → final CSV with image paths |
+| 3 | Queue image jobs → format-correct scene images → final CSV with image paths |
 | 4 | Gradio web UI — upload, analyze, review, generate |
 
 ## Quick start
@@ -41,11 +41,25 @@ python -m ai_visualizer generate-images --plan scene_plan.json --backend mock --
 python -m ai_visualizer generate-images --plan scene_plan.json --backend mock
 ```
 
-### Phase 4 — Web UI
+### Narrato Studio
 ```bash
 python -m ai_visualizer ui
 # Open http://localhost:7860
 ```
+
+Studio loads `scene_plan.json` and the existing image manifest, then runs the
+same `image_runner` pipeline as the CLI. Select **local** for a configured
+ComfyUI server or **api** for Gemini. API generation requires an explicit
+confirmation in the UI. Jobs run in a background worker; cancellation stops
+queued scenes and waits for active backend calls to finish. Non-secret UI
+preferences are saved to the current user's Narrato settings directory.
+
+The **Check backend readiness** button performs ComfyUI connectivity, workflow,
+and model checks for local generation. For Gemini it only verifies local
+configuration and displays the model; it does not make an API request.
+Existing files are not replaced unless **Explicitly replace existing output
+files** is checked. The gallery previews valid generated images; placeholder
+images are labeled as such. Studio does not assemble a video.
 
 ## Scene grouping
 
@@ -79,17 +93,21 @@ separate manifest.
 
 ## Image backends
 
-Copy `.env.example` to `.env`. `IMAGE_BACKEND` selects exactly one backend;
-generation errors do not trigger a fallback.
+Set backend configuration in the project-root `.env` file. Keep that file
+private; `IMAGE_BACKEND` selects exactly one backend and generation errors do
+not trigger a fallback.
 
 ```
 IMAGE_BACKEND=mock           # mock | api | local
 GEMINI_API_KEY=...           # only needed for api
 GEMINI_IMAGE_MODEL=gemini-nano-banana-2.1
-COMFYUI_BASE_URL=http://127.0.0.1:8188
+COMFYUI_URL=http://127.0.0.1:8188
 COMFYUI_WORKFLOW=C:\path\to\workflow_api.json
 COMFYUI_MODEL=               # optional model override for a single loader node
 ```
+
+`COMFYUI_BASE_URL` remains supported as a compatibility alias when
+`COMFYUI_URL` is not set.
 
 The Gemini image backend uses the official Gemini Interactions REST API and
 the configurable `GEMINI_IMAGE_MODEL`. The key is sent in an HTTP header, not
@@ -116,16 +134,16 @@ One-image commands (replace paths/settings as needed):
 
 ```bash
 # First configure GEMINI_API_KEY in .env. This explicitly makes one real API request.
-python -m ai_visualizer generate-images --plan scene_plan.json --backend api --scenes 1 --force --retries 0
+python -m ai_visualizer generate-images --plan scene_plan.json --output outputs/api_pilot --manifest outputs/api_pilot_manifest.json --backend api --scenes 1 --force --retries 0
 
 # Configure a reachable ComfyUI server and API-format workflow in .env first.
-python -m ai_visualizer generate-images --plan scene_plan.json --backend local --scenes 1 --force --retries 0
+python -m ai_visualizer generate-images --plan scene_plan.json --output outputs/local_pilot --manifest outputs/local_pilot_manifest.json --backend local --scenes 1 --force --retries 0
 ```
 
 ## Testing
 
 ```bash
-python -m pytest tests -v
+python -m pytest tests -q
 ```
 
 The suite uses mocked network responses and the mock backend; no API keys,
@@ -140,8 +158,8 @@ outputs/
   scenes_gemini.csv          # Phase 2 output (if --gemini)
   scenes_with_images.csv     # Phase 3 output (includes image paths)
   images/
-    scene_001.png
-    scene_002.png
+    scene_001.png            # mock and ComfyUI backends
+    scene_001.jpg            # Gemini API backend
     ...
   image_manifest.json        # scene status, backend/model, prompt, output and errors
 ```
@@ -149,3 +167,5 @@ outputs/
 `generate-images` defaults to `outputs/images/` and writes its manifest to
 `outputs/image_manifest.json`. The scene-plan JSON and CSV, including their
 timestamps and scene contents, are inputs to this stage and are not rewritten.
+The Gemini API returns JPEG, so those outputs and manifest filenames use
+`.jpg`; mock and ComfyUI outputs remain PNG.

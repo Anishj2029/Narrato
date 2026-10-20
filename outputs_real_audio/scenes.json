@@ -1,0 +1,74 @@
+[
+  {
+    "index": 1,
+    "title": "The Rise of AI",
+    "text": "The Rise of AI",
+    "start_time": 0.0,
+    "end_time": 12.879,
+    "image_prompt": "",
+    "image_path": ""
+  },
+  {
+    "index": 2,
+    "title": "Decades before anyone called it artificial…",
+    "text": "Decades before anyone called it artificial intelligence, mathematicians were already dreaming of thinking machines. Alan Turing asked a deceptively simple question: can a machine think? That question would echo across the next century and change everything.",
+    "start_time": 12.879,
+    "end_time": 128.787,
+    "image_prompt": "",
+    "image_path": ""
+  },
+  {
+    "index": 3,
+    "title": "Early computers filled entire rooms. They…",
+    "text": "Early computers filled entire rooms. They were powerful for their time, solving equations that would take humans years. But they could only do what they were explicitly told. They had no ability to learn, no ability to adapt.",
+    "start_time": 128.787,
+    "end_time": 251.135,
+    "image_prompt": "",
+    "image_path": ""
+  },
+  {
+    "index": 4,
+    "title": "Progress stalled. Twice, funding dried up…",
+    "text": "Progress stalled. Twice, funding dried up and the field nearly died. These became known as the AI winters. Researchers kept working, quietly, in labs around the world, convinced that a breakthrough was coming.",
+    "start_time": 251.135,
+    "end_time": 357.385,
+    "image_prompt": "",
+    "image_path": ""
+  },
+  {
+    "index": 5,
+    "title": "Everything changed when researchers revisited an…",
+    "text": "Everything changed when researchers revisited an old idea: the artificial neural network. Inspired by the human brain, these systems could learn patterns from raw data. Give them enough examples, and they would figure out the rules themselves.",
+    "start_time": 357.385,
+    "end_time": 476.513,
+    "image_prompt": "",
+    "image_path": ""
+  },
+  {
+    "index": 6,
+    "title": "The internet gave AI something it…",
+    "text": "The internet gave AI something it had always lacked: scale. Billions of images, conversations, and documents became training material. The machines began to see, to understand language, and eventually to create.",
+    "start_time": 476.513,
+    "end_time": 576.323,
+    "image_prompt": "",
+    "image_path": ""
+  },
+  {
+    "index": 7,
+    "title": "Where We Stand Today",
+    "text": "Where We Stand Today",
+    "start_time": 576.323,
+    "end_time": 589.202,
+    "image_prompt": "",
+    "image_path": ""
+  },
+  {
+    "index": 8,
+    "title": "Today, AI writes code, composes music,…",
+    "text": "Today, AI writes code, composes music, and holds conversations indistinguishable from a human's. We are only at the beginning. The question Alan Turing asked is no longer hypothetical. It has been answered — and the answer keeps evolving.",
+    "start_time": 589.202,
+    "end_time": 711.549,
+    "image_prompt": "",
+    "image_path": ""
+  }
+]

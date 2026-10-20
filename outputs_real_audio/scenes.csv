@@ -1,0 +1,9 @@
+index,title,text,start_time,end_time,image_prompt,image_path
+1,The Rise of AI,The Rise of AI,0.0,12.879,,
+2,Decades before anyone called it artificial…,"Decades before anyone called it artificial intelligence, mathematicians were already dreaming of thinking machines. Alan Turing asked a deceptively simple question: can a machine think? That question would echo across the next century and change everything.",12.879,128.787,,
+3,Early computers filled entire rooms. They…,"Early computers filled entire rooms. They were powerful for their time, solving equations that would take humans years. But they could only do what they were explicitly told. They had no ability to learn, no ability to adapt.",128.787,251.135,,
+4,"Progress stalled. Twice, funding dried up…","Progress stalled. Twice, funding dried up and the field nearly died. These became known as the AI winters. Researchers kept working, quietly, in labs around the world, convinced that a breakthrough was coming.",251.135,357.385,,
+5,Everything changed when researchers revisited an…,"Everything changed when researchers revisited an old idea: the artificial neural network. Inspired by the human brain, these systems could learn patterns from raw data. Give them enough examples, and they would figure out the rules themselves.",357.385,476.513,,
+6,The internet gave AI something it…,"The internet gave AI something it had always lacked: scale. Billions of images, conversations, and documents became training material. The machines began to see, to understand language, and eventually to create.",476.513,576.323,,
+7,Where We Stand Today,Where We Stand Today,576.323,589.202,,
+8,"Today, AI writes code, composes music,…","Today, AI writes code, composes music, and holds conversations indistinguishable from a human's. We are only at the beginning. The question Alan Turing asked is no longer hypothetical. It has been answered — and the answer keeps evolving.",589.202,711.549,,

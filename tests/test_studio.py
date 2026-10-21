@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 from pathlib import Path
@@ -66,6 +67,8 @@ def test_settings_persist_non_secret_fields_only(tmp_path):
         comfyui_url="http://127.0.0.1:8188",
         workflow_path="workflow.json",
         selected_scenes=("1", "3"),
+        positive_quality_prompt="Film look",
+        negative_quality_prompt="Blurry",
     )
 
     studio.save_settings(settings, path)
@@ -75,6 +78,21 @@ def test_settings_persist_non_secret_fields_only(tmp_path):
     assert loaded == settings
     assert "api_key" not in json.dumps(stored).lower()
     assert stored["selected_scenes"] == ["1", "3"]
+    assert loaded.positive_quality_prompt == "Film look"
+    assert loaded.negative_quality_prompt == "Blurry"
+
+
+def test_workflow_dimensions_are_a_valid_studio_setting():
+    studio.validate_studio_settings(
+        "api",
+        "plan.json",
+        "images",
+        "manifest.json",
+        "Workflow dimensions",
+        1,
+        0,
+        0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -131,6 +149,71 @@ def test_missing_or_invalid_scene_plan_is_reported(tmp_path):
     assert gallery == []
     assert scene_ids == []
     assert failed_ids == []
+    assert "Scene plan not found" in info
+    assert str(tmp_path / "missing.json") in info
+
+
+def test_missing_relative_scene_plan_reports_project_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    missing_name = "narrato-missing-scene-plan.json"
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        studio._read_plan(missing_name)
+
+    assert str(studio._PROJECT_ROOT / missing_name) in str(exc_info.value)
+
+
+def test_relative_scene_plan_resolves_from_project_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    scenes = studio._read_plan("scene_plan.json")
+
+    assert len(scenes) == len(json.loads(
+        (studio._PROJECT_ROOT / "scene_plan.json").read_text(encoding="utf-8")
+    ))
+
+
+def test_refresh_callback_loads_relative_scene_plan_from_project_root(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    app = studio.build_ui()
+    refresh = next(
+        callback.fn
+        for dependency, callback in zip(app.config["dependencies"], app.fns)
+        if dependency["api_name"] == "refresh_dashboard"
+    )
+
+    result = refresh("scene_plan.json", "outputs/images", "outputs/manifest.json")
+
+    assert result[0].startswith("**Plan ready**")
+    assert len(result[3]) == len(studio._read_plan("scene_plan.json"))
+    scenes = studio._read_plan("scene_plan.json")
+    assert result[5]["choices"] == [str(scene["index"]) for scene in scenes]
+    assert result[6]["choices"] == []
+
+
+def test_refresh_dashboard_returns_file_paths_accepted_by_gradio(tmp_path):
+    import gradio as gr
+
+    plan = tmp_path / "scene_plan.json"
+    _write_plan(plan)
+    csv_path = plan.with_suffix(".csv")
+    csv_path.write_text("index,title\n1,Scene 1\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("[]", encoding="utf-8")
+    output_dir = tmp_path / "images"
+
+    outputs = studio.refresh_dashboard(str(plan), str(output_dir), str(manifest))
+
+    assert len(outputs) == 10
+    assert outputs[0].startswith("**Plan ready**")
+    assert outputs[7] == str(manifest)
+    assert outputs[8] == str(csv_path)
+    manifest_output = gr.File().postprocess(outputs[7])
+    csv_output = gr.File().postprocess(outputs[8])
+    assert manifest_output.path == str(manifest)
+    assert csv_output.path == str(csv_path)
 
 
 def test_studio_builds_with_project_gradio_dependency():
@@ -139,6 +222,115 @@ def test_studio_builds_with_project_gradio_dependency():
     app = studio.build_ui()
 
     assert isinstance(app, gr.Blocks)
+
+
+def test_studio_api_info_excludes_filedata_schemas_without_hiding_callbacks():
+    app = studio.build_ui()
+    config = app.get_config_file()
+    file_components = [
+        component
+        for component in config["components"]
+        if component["type"] in {"gallery", "file"}
+    ]
+    assert len(file_components) == 3
+    assert all(component["skip_api"] for component in file_components)
+
+    api_info = app.get_api_info()
+
+    assert "/refresh_dashboard" in api_info["named_endpoints"]
+    assert "/refresh_dashboard_1" in api_info["named_endpoints"]
+    assert "/continuous_coro" in api_info["named_endpoints"]
+    assert len(
+        api_info["named_endpoints"]["/refresh_dashboard"]["parameters"]
+    ) == 3
+    assert len(
+        api_info["named_endpoints"]["/refresh_dashboard"]["returns"]
+    ) == 7
+    assert len(api_info["named_endpoints"]["/start_handler"]["parameters"]) == 16
+    assert len(api_info["named_endpoints"]["/retry_one"]["parameters"]) == 17
+    assert len(api_info["named_endpoints"]["/continuous_coro"]["parameters"]) == 3
+    assert all(
+        dep["show_api"]
+        for dep in config["dependencies"]
+    )
+
+
+def test_studio_event_callback_arities_match_registered_dependencies():
+    app = studio.build_ui()
+    expected_counts = {
+        "backend_visibility": (1, 3),
+        "lambda": (1, 1),
+        "refresh_dashboard": (3, 10),
+        "check_backend_readiness": (3, 1),
+        "start_handler": (16, 1),
+        "refresh_dashboard_1": (3, 10),
+        "cancel_generation": (0, 1),
+        "retry_one": (17, 1),
+        "continuous_coro": (3, 10),
+    }
+
+    assert len(app.config["dependencies"]) == len(expected_counts)
+    for dependency, callback in zip(app.config["dependencies"], app.fns):
+        name = dependency["api_name"]
+        input_count, output_count = expected_counts[name]
+        assert len(dependency["inputs"]) == input_count
+        assert len(dependency["outputs"]) == output_count
+        assert len(callback.inputs) == input_count
+        assert len(callback.outputs) == output_count
+
+        parameters = inspect.signature(callback.fn).parameters.values()
+        positional_count = sum(
+            parameter.kind
+            in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+            for parameter in parameters
+        )
+        accepts_varargs = any(
+            parameter.kind == parameter.VAR_POSITIONAL
+            for parameter in parameters
+        )
+        assert accepts_varargs or positional_count == input_count
+
+
+def test_start_and_retry_callbacks_forward_all_registered_inputs(monkeypatch):
+    app = studio.build_ui()
+    callbacks = {
+        dependency["api_name"]: callback.fn
+        for dependency, callback in zip(app.config["dependencies"], app.fns)
+    }
+    calls = []
+
+    def record_start_generation(*args):
+        calls.append(args)
+        return "Started"
+
+    monkeypatch.setattr(studio, "start_generation", record_start_generation)
+    start_values = [
+        "local",
+        "scene_plan.json",
+        "outputs/images",
+        "outputs/manifest.json",
+        "Workflow dimensions",
+        "All scenes",
+        [],
+        2,
+        0.5,
+        1,
+        False,
+        False,
+        "http://127.0.0.1:8188",
+        "workflow.json",
+        "positive prompt",
+        "negative prompt",
+    ]
+
+    assert callbacks["start_handler"](*start_values) == "Started"
+    assert calls[-1] == tuple(start_values)
+
+    assert callbacks["retry_one"](*start_values, "7") == "Started"
+    retry_values = start_values.copy()
+    retry_values[5] = "Selected scenes"
+    retry_values[6] = ["7"]
+    assert calls[-1] == tuple(retry_values)
 
 
 def test_dashboard_uses_manifest_statuses_and_handles_invalid_preview(tmp_path):
@@ -233,6 +425,29 @@ def test_api_readiness_checks_configuration_without_request(monkeypatch):
     assert "No API request was made" in status
 
 
+def test_local_readiness_reports_server_unavailable(tmp_path, monkeypatch):
+    workflow = tmp_path / "workflow.json"
+    workflow.write_text(
+        '{"1": {"class_type": "SaveImage", "inputs": {}}}',
+        encoding="utf-8",
+    )
+    from ai_visualizer import image_backends
+
+    monkeypatch.setattr(
+        image_backends.requests,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            image_backends.requests.ConnectionError("connection refused")
+        ),
+    )
+    status = studio.check_backend_readiness(
+        "local", "http://127.0.0.1:8188", str(workflow)
+    )
+
+    assert "Not ready" in status
+    assert "ComfyUI request failed during preflight" in status
+
+
 def test_start_generation_runs_in_background_and_reports_status(
     tmp_path, monkeypatch
 ):
@@ -250,7 +465,10 @@ def test_start_generation_runs_in_background_and_reports_status(
     monkeypatch.setattr(studio, "ComfyUIBackend", LocalBackend)
     monkeypatch.setattr(studio, "save_settings", lambda settings: None)
 
+    received_configs = []
+
     def fake_run(config):
+        received_configs.append(config)
         config.progress_callback("running", 1, None, 0, 1)
         result = SceneResult(
             index=1, title="Scene 1", filename="scene_001.png",
@@ -275,6 +493,8 @@ def test_start_generation_runs_in_background_and_reports_status(
         False,
         "http://127.0.0.1:8188",
         str(workflow),
+        "Film look",
+        "No artifacts",
     )
     worker = studio._JOB["thread"]
     worker.join(timeout=2)
@@ -285,6 +505,8 @@ def test_start_generation_runs_in_background_and_reports_status(
     assert snapshot["completed"] == 1
     assert snapshot["scene_status"][1] == "skipped"
     assert snapshot["results"][0].status == "skipped"
+    assert received_configs[0].positive_quality_prompt == "Film look"
+    assert received_configs[0].negative_quality_prompt == "No artifacts"
 
 
 def test_background_job_exception_is_exposed_as_failed_status(tmp_path, monkeypatch):

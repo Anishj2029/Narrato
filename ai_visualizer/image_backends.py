@@ -38,7 +38,8 @@ class BackendConfigurationError(ValueError):
 
 @dataclass(frozen=True)
 class ImageOptions:
-    aspect_ratio: Optional[str] = "16:9"
+    aspect_ratio: Optional[str] = None
+    negative_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -71,9 +72,9 @@ def validate_options(options: ImageOptions) -> None:
         )
 
 
-def _dimensions(aspect_ratio: str) -> tuple[int, int]:
+def _dimensions(aspect_ratio: str, max_dimension: int = 1024) -> tuple[int, int]:
     width_ratio, height_ratio = (int(part) for part in aspect_ratio.split(":"))
-    scale = 1024 / max(width_ratio, height_ratio)
+    scale = max_dimension / max(width_ratio, height_ratio)
     width = max(256, int(math.floor(width_ratio * scale / 64 + 0.5)) * 64)
     height = max(256, int(math.floor(height_ratio * scale / 64 + 0.5)) * 64)
     return width, height
@@ -250,9 +251,15 @@ class GeminiApiBackend:
             validate_options(options)
             if not image_prompt.strip():
                 raise ValueError("image_prompt is empty")
+            request_prompt = image_prompt
+            if options.negative_prompt.strip():
+                request_prompt += (
+                    "\nAvoid these visual qualities and elements: "
+                    f"{options.negative_prompt}"
+                )
             payload: Dict[str, Any] = {
                 "model": self.model_identifier,
-                "input": [{"type": "text", "text": image_prompt}],
+                "input": [{"type": "text", "text": request_prompt}],
             }
             if options.aspect_ratio:
                 payload["response_format"] = {
@@ -342,7 +349,6 @@ class GeminiApiBackend:
 class ComfyUIBackend:
     name = "local"
     output_extension = ".png"
-    _PROMPT_TOKEN = "{{prompt}}"
 
     def __init__(
         self,
@@ -351,6 +357,8 @@ class ComfyUIBackend:
         model: Optional[str] = None,
         timeout: Optional[float] = None,
         poll_interval: Optional[float] = None,
+        positive_node_id: Optional[str] = None,
+        negative_node_id: Optional[str] = None,
     ) -> None:
         configured_url = (
             base_url
@@ -367,7 +375,7 @@ class ComfyUIBackend:
             raise BackendConfigurationError(
                 "COMFYUI_WORKFLOW must point to a ComfyUI API-format workflow JSON file."
             )
-        self.workflow_path = Path(configured_workflow).expanduser()
+        self.workflow_path = Path(os.path.expandvars(configured_workflow)).expanduser()
         if not self.workflow_path.is_file():
             raise BackendConfigurationError(f"ComfyUI workflow not found: {self.workflow_path}")
         try:
@@ -377,11 +385,89 @@ class ComfyUIBackend:
         if not isinstance(workflow, dict) or not workflow:
             raise BackendConfigurationError("ComfyUI workflow must be a non-empty API-format object.")
         self.workflow = workflow
+        self.positive_node_id = (
+            positive_node_id or os.getenv("COMFYUI_POSITIVE_NODE_ID", "")
+        ).strip() or None
+        self.negative_node_id = (
+            negative_node_id or os.getenv("COMFYUI_NEGATIVE_NODE_ID", "")
+        ).strip() or None
         self.model_override = (model if model is not None else os.getenv("COMFYUI_MODEL", "")).strip()
         self.timeout = _positive_timeout(timeout, "COMFYUI_TIMEOUT_SECONDS", 600)
         self.poll_interval = _positive_timeout(poll_interval, "COMFYUI_POLL_INTERVAL", 2)
         self.model_identifier = self.model_override or self._workflow_model_names()
         self._preflight_done = False
+
+    def _text_node_id(self, role: str) -> str:
+        configured_id = (
+            self.positive_node_id if role == "positive" else self.negative_node_id
+        )
+        nodes = {
+            str(node_id): node
+            for node_id, node in self.workflow.items()
+            if isinstance(node, dict)
+            and node.get("class_type") == "CLIPTextEncode"
+            and isinstance(node.get("inputs"), dict)
+            and isinstance(node["inputs"].get("text"), str)
+        }
+        if configured_id is not None:
+            if configured_id not in nodes:
+                raise ValueError(
+                    f"Configured ComfyUI {role} text node {configured_id!r} "
+                    "is missing or is not a CLIPTextEncode node with a text input."
+                )
+            return configured_id
+
+        connected = set()
+        for node in self.workflow.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs", {})
+            link = inputs.get(role)
+            if isinstance(link, (list, tuple)) and link:
+                linked_id = str(link[0])
+                if linked_id in nodes:
+                    connected.add(linked_id)
+
+        token = "{{prompt}}" if role == "positive" else "{{negative_prompt}}"
+        token_matches = [
+            node_id for node_id, node in nodes.items()
+            if token in node["inputs"]["text"]
+        ]
+        connected_token_matches = [
+            node_id for node_id in token_matches if node_id in connected
+        ]
+        if len(connected_token_matches) == 1:
+            return connected_token_matches[0]
+        if len(connected_token_matches) > 1:
+            raise ValueError(
+                f"ComfyUI workflow has multiple connected {role} text placeholders; "
+                f"set COMFYUI_{role.upper()}_NODE_ID."
+            )
+        if connected and token_matches:
+            raise ValueError(
+                f"The ComfyUI {role} text placeholder is not connected to the "
+                f"workflow's {role} input."
+            )
+        if len(token_matches) == 1:
+            return token_matches[0]
+        if len(token_matches) > 1:
+            raise ValueError(
+                f"ComfyUI workflow has multiple {role} text placeholders; "
+                f"set COMFYUI_{role.upper()}_NODE_ID."
+            )
+
+        if len(connected) == 1:
+            return next(iter(connected))
+        if len(connected) > 1:
+            raise ValueError(
+                f"ComfyUI workflow has multiple {role} CLIPTextEncode nodes; "
+                f"set COMFYUI_{role.upper()}_NODE_ID."
+            )
+        raise ValueError(
+            f"Could not identify the ComfyUI {role} CLIPTextEncode node. "
+            f"Add the {token} placeholder to its text input or set "
+            f"COMFYUI_{role.upper()}_NODE_ID."
+        )
 
     def _model_nodes(self) -> List[tuple[str, str, str]]:
         found: List[tuple[str, str, str]] = []
@@ -426,15 +512,8 @@ class ComfyUIBackend:
                 for node in self.workflow.values()
             ):
                 raise ValueError("ComfyUI workflow must contain a SaveImage node")
-            if not any(
-                isinstance(value, str) and self._PROMPT_TOKEN in value
-                for node in self.workflow.values()
-                if isinstance(node, dict)
-                for value in node.get("inputs", {}).values()
-            ):
-                raise ValueError(
-                    "ComfyUI workflow must include {{prompt}} in the positive text input."
-                )
+            self.positive_node_id = self._text_node_id("positive")
+            self.negative_node_id = self._text_node_id("negative")
 
             model_nodes = self._model_nodes()
             if not model_nodes:
@@ -480,42 +559,53 @@ class ComfyUIBackend:
                 raise ValueError("image_prompt is empty")
             if not self._preflight_done:
                 self.preflight()
-            width, height = _dimensions(options.aspect_ratio or "16:9")
+            width = height = None
+            if options.aspect_ratio:
+                width, height = _dimensions(options.aspect_ratio, max_dimension=768)
             workflow = json.loads(json.dumps(self.workflow))
-            prompt_used = False
+            positive_node = workflow[self.positive_node_id]
+            negative_node = workflow[self.negative_node_id]
+            positive_node["inputs"]["text"] = image_prompt
+            negative_node["inputs"]["text"] = options.negative_prompt
             for node in workflow.values():
                 if not isinstance(node, dict):
                     continue
                 inputs = node.get("inputs", {})
                 for key, value in list(inputs.items()):
-                    if isinstance(value, str) and self._PROMPT_TOKEN in value:
-                        prompt_used = True
                     if isinstance(value, str):
-                        inputs[key] = value.replace(self._PROMPT_TOKEN, image_prompt)
-                        inputs[key] = inputs[key].replace(
-                            "{{filename_prefix}}", f"sceneflow_{scene_id}"
+                        inputs[key] = value.replace(
+                            "{{filename_prefix}}", f"narrato_{scene_id}"
                         )
                         inputs[key] = inputs[key].replace("{{model}}", self.model_identifier)
-                if node.get("class_type") in {
+                if width is not None and height is not None and node.get("class_type") in {
                     "EmptyLatentImage", "EmptySD3LatentImage", "EmptyLatentImageAdvanced",
                 }:
                     if "width" in inputs and "height" in inputs:
                         inputs["width"] = width
                         inputs["height"] = height
-            if not prompt_used:
-                raise ValueError("ComfyUI workflow does not contain a {{prompt}} placeholder")
-            replacements = {
-                "{{width}}": str(width),
-                "{{height}}": str(height),
-            }
-            for node in workflow.values():
-                if not isinstance(node, dict):
-                    continue
-                inputs = node.get("inputs", {})
-                for key, value in list(inputs.items()):
-                    if isinstance(value, str):
-                        for token, replacement in replacements.items():
-                            inputs[key] = inputs[key].replace(token, replacement)
+            if options.aspect_ratio:
+                replacements = {
+                    "{{width}}": str(width),
+                    "{{height}}": str(height),
+                }
+                for node in workflow.values():
+                    if not isinstance(node, dict):
+                        continue
+                    inputs = node.get("inputs", {})
+                    for key, value in list(inputs.items()):
+                        if isinstance(value, str):
+                            for token, replacement in replacements.items():
+                                inputs[key] = inputs[key].replace(token, replacement)
+            elif any(
+                isinstance(value, str) and value in {"{{width}}", "{{height}}"}
+                for node in workflow.values()
+                if isinstance(node, dict)
+                for value in node.get("inputs", {}).values()
+            ):
+                raise ValueError(
+                    "Select an aspect ratio to resolve {{width}} and {{height}} "
+                    "workflow placeholders."
+                )
             if options.aspect_ratio and not any(
                 isinstance(node, dict)
                 and node.get("class_type") in {
@@ -577,6 +667,15 @@ class ComfyUIBackend:
                 raise ValueError("ComfyUI returned an empty image")
             if not image_response.content.startswith(b"\x89PNG\r\n\x1a\n"):
                 raise ValueError("ComfyUI response was not PNG image data")
+            try:
+                from PIL import Image
+
+                with Image.open(BytesIO(image_response.content)) as image_data:
+                    if image_data.format != "PNG":
+                        raise ValueError("ComfyUI response was not PNG image data")
+                    image_data.verify()
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"ComfyUI returned an invalid PNG image: {exc}") from exc
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(image_response.content)
             return _success(output_path, self.name, self.model_identifier)

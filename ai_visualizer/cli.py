@@ -168,8 +168,11 @@ def main() -> None:
                        help="Image backend (default: IMAGE_BACKEND, then mock)")
     p_gen.add_argument("--manifest", default=None,
                        help="Manifest path (default: outputs/image_manifest.json)")
-    p_gen.add_argument("--aspect-ratio", default="16:9",
-                       help="Image aspect ratio (default: 16:9)")
+    p_gen.add_argument(
+        "--aspect-ratio",
+        default=None,
+        help="Optional image aspect ratio override (default: preserve workflow dimensions)",
+    )
     p_gen.add_argument("--concurrency", type=int, default=1,
                        help="Maximum concurrent image jobs (default: 1)")
     p_gen.add_argument("--delay",    type=float, default=2.0,

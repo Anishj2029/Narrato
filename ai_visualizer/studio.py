@@ -29,8 +29,10 @@ from .image_runner import (
     run_image_generation,
     validate_scene_plan,
 )
+from .image_prompts import DEFAULT_NEGATIVE_PROMPT, DEFAULT_POSITIVE_PROMPT
 
 _SETTINGS_PATH = Path(os.getenv("APPDATA", str(Path.home()))) / "Narrato" / "studio_settings.json"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _JOB_LOCK = threading.RLock()
 _JOB: Dict[str, Any] = {
     "status": "idle",
@@ -49,18 +51,20 @@ _JOB: Dict[str, Any] = {
 
 @dataclass(frozen=True)
 class StudioSettings:
-    plan_path: str = "scene_plan.json"
-    output_dir: str = "outputs/images"
-    manifest_path: str = "outputs/image_manifest.json"
+    plan_path: str = str(_PROJECT_ROOT / "scene_plan.json")
+    output_dir: str = str(_PROJECT_ROOT / "outputs" / "images")
+    manifest_path: str = str(_PROJECT_ROOT / "outputs" / "image_manifest.json")
     backend: str = "local"
     comfyui_url: str = ""
     workflow_path: str = ""
-    aspect_ratio: str = "16:9"
+    aspect_ratio: str = "Workflow dimensions"
     selection_mode: str = "All scenes"
     selected_scenes: tuple[str, ...] = ()
     concurrency: int = 1
     delay_seconds: float = 2.0
     retries: int = 2
+    positive_quality_prompt: str = DEFAULT_POSITIVE_PROMPT
+    negative_quality_prompt: str = DEFAULT_NEGATIVE_PROMPT
 
 
 def load_settings(path: Path = _SETTINGS_PATH) -> StudioSettings:
@@ -100,6 +104,14 @@ def save_settings(settings: StudioSettings, path: Path = _SETTINGS_PATH) -> None
     temporary.replace(path)
 
 
+def _project_path(path: str | Path) -> Path:
+    """Resolve relative Studio paths from the repository root."""
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = _PROJECT_ROOT / resolved
+    return resolved.resolve()
+
+
 def validate_studio_settings(
     backend: str,
     plan_path: str,
@@ -116,7 +128,7 @@ def validate_studio_settings(
         raise ValueError("Choose either the local or API backend.")
     if not plan_path.strip() or not output_dir.strip() or not manifest_path.strip():
         raise ValueError("Plan, output, and manifest paths are required.")
-    if aspect_ratio not in SUPPORTED_ASPECT_RATIOS:
+    if aspect_ratio != "Workflow dimensions" and aspect_ratio not in SUPPORTED_ASPECT_RATIOS:
         raise ValueError(f"Unsupported aspect ratio: {aspect_ratio}")
     try:
         concurrency_value = float(concurrency)
@@ -156,7 +168,7 @@ def validate_studio_settings(
 
 
 def _read_plan(plan_path: str) -> List[Dict[str, Any]]:
-    path = Path(plan_path).expanduser()
+    path = _project_path(plan_path)
     if not path.is_file():
         raise FileNotFoundError(f"Scene plan not found: {path}")
     try:
@@ -271,7 +283,7 @@ def _plan_status(plan_path: str, output_dir: str, manifest_path: str):
 
     runtime_error = current_status["error"]
     note = (
-        f"**Plan ready** · {len(scenes)} scenes · `{Path(plan_path).expanduser()}`"
+        f"**Plan ready** · {len(scenes)} scenes · `{_project_path(plan_path)}`"
         if not runtime_error
         else f"**Last job error:** {runtime_error}"
     )
@@ -359,8 +371,17 @@ def start_generation(
     replace_existing: bool,
     comfyui_url: str = "",
     workflow_path: str = "",
+    positive_quality_prompt: str = DEFAULT_POSITIVE_PROMPT,
+    negative_quality_prompt: str = DEFAULT_NEGATIVE_PROMPT,
 ) -> str:
     """Validate and start one non-blocking image-generation job."""
+    plan_path = str(_project_path(plan_path))
+    output_dir = str(_project_path(output_dir))
+    manifest_path = str(_project_path(manifest_path))
+    if not isinstance(positive_quality_prompt, str) or not isinstance(
+        negative_quality_prompt, str
+    ):
+        raise ValueError("Quality prompts must be text.")
     validate_studio_settings(
         backend,
         plan_path,
@@ -427,6 +448,8 @@ def start_generation(
         concurrency=int(concurrency),
         delay_seconds=float(delay_seconds),
         retries=int(retries),
+        positive_quality_prompt=positive_quality_prompt,
+        negative_quality_prompt=negative_quality_prompt,
     )
     save_settings(settings)
 
@@ -465,7 +488,11 @@ def start_generation(
                 max_retries=int(retries),
                 force=bool(replace_existing),
                 scene_indexes=indexes,
-                aspect_ratio=aspect_ratio,
+                aspect_ratio=(
+                    None if aspect_ratio == "Workflow dimensions" else aspect_ratio
+                ),
+                positive_quality_prompt=positive_quality_prompt,
+                negative_quality_prompt=negative_quality_prompt,
                 concurrency=int(concurrency),
                 cancel_event=cancel_event,
                 progress_callback=_progress_callback,
@@ -540,10 +567,10 @@ def check_backend_readiness(
 
 
 def _refresh_files(manifest_path: str, plan_path: str, output_dir: str):
-    manifest = Path(manifest_path).expanduser()
-    csv_path = Path(plan_path).expanduser().with_suffix(".csv")
-    folder = Path(plan_path).expanduser().parent
-    resolved_output_dir = Path(output_dir).expanduser()
+    manifest = _project_path(manifest_path)
+    csv_path = _project_path(plan_path).with_suffix(".csv")
+    folder = _project_path(plan_path).parent
+    resolved_output_dir = _project_path(output_dir)
     status = _snapshot_job()
     if status.get("results"):
         image_paths = [result.image_path for result in status["results"] if result.image_path]
@@ -552,8 +579,8 @@ def _refresh_files(manifest_path: str, plan_path: str, output_dir: str):
     resolved_output_dir = resolved_output_dir.resolve()
     folder_link = f"file:///{quote(str(resolved_output_dir).replace(os.sep, '/'), safe='/:')}"
     return (
-        manifest if manifest.is_file() else None,
-        csv_path if csv_path.is_file() else None,
+        str(manifest) if manifest.is_file() else None,
+        str(csv_path) if csv_path.is_file() else None,
         f"**Output folder:** [{resolved_output_dir}]({folder_link})  \n"
         f"**Scene-plan folder:** `{folder.resolve()}`",
     )
@@ -603,6 +630,35 @@ def gr_update(**kwargs):
 
 def build_ui():
     import gradio as gr
+
+    class _NoPyiComponentMeta(type(gr.Gallery)):
+        def __new__(metaclass, name, bases, attributes, **kwargs):
+            return type.__new__(metaclass, name, bases, attributes)
+
+        def __init__(cls, name, bases, attributes, **kwargs):
+            type.__init__(cls, name, bases, attributes)
+
+    class _StudioGallery(gr.Gallery, metaclass=_NoPyiComponentMeta):
+        @property
+        def skip_api(self):
+            return True
+
+        def get_block_name(self) -> str:
+            return "gallery"
+
+        def get_block_class(self) -> str:
+            return "gallery"
+
+    class _StudioFile(gr.File, metaclass=_NoPyiComponentMeta):
+        @property
+        def skip_api(self):
+            return True
+
+        def get_block_name(self) -> str:
+            return "file"
+
+        def get_block_class(self) -> str:
+            return "file"
 
     settings_warning = ""
     try:
@@ -681,9 +737,19 @@ def build_ui():
 
                 gr.Markdown("### Generation")
                 aspect_ratio = gr.Dropdown(
-                    choices=sorted(SUPPORTED_ASPECT_RATIOS),
+                    choices=["Workflow dimensions", *sorted(SUPPORTED_ASPECT_RATIOS)],
                     value=settings.aspect_ratio,
-                    label="Aspect ratio",
+                    label="Aspect ratio override",
+                )
+                positive_quality_prompt = gr.TextArea(
+                    label="Permanent positive quality prompt",
+                    value=settings.positive_quality_prompt,
+                    lines=4,
+                )
+                negative_quality_prompt = gr.TextArea(
+                    label="Permanent negative quality prompt",
+                    value=settings.negative_quality_prompt,
+                    lines=4,
                 )
                 selection_mode = gr.Radio(
                     choices=["All scenes", "Selected scenes", "Failed scenes only"],
@@ -734,7 +800,7 @@ def build_ui():
                 counts = gr.Markdown(_counts_markdown(0, 0, 0, 0))
                 progress = gr.Markdown("**Job:** idle")
                 gr.Markdown("### Scene gallery")
-                gallery = gr.Gallery(
+                gallery = _StudioGallery(
                     label="Generated images · click a thumbnail to preview",
                     columns=3,
                     height=520,
@@ -751,8 +817,12 @@ def build_ui():
                     wrap=True,
                 )
                 with gr.Row():
-                    manifest_file = gr.File(label="Download manifest", interactive=False)
-                    csv_file = gr.File(label="Download scene-plan CSV", interactive=False)
+                    manifest_file = _StudioFile(
+                        label="Download manifest", interactive=False
+                    )
+                    csv_file = _StudioFile(
+                        label="Download scene-plan CSV", interactive=False
+                    )
                 paths = gr.Markdown()
 
         def backend_visibility(value):
@@ -802,6 +872,8 @@ def build_ui():
             replace_existing,
             comfyui_url,
             workflow_path,
+            positive_quality_prompt,
+            negative_quality_prompt,
         ]
 
         def start_handler(*values):
@@ -822,13 +894,16 @@ def build_ui():
                 selected_scenes, failed_scene, manifest_file, csv_file, paths,
             ],
         )
-        cancel_btn.click(cancel_generation, outputs=[action_status])
+        cancel_btn.click(
+            cancel_generation, outputs=[action_status]
+        )
 
         def retry_one(*values):
             (
                 backend_value, plan_value, output_value, manifest_value, ratio,
                 mode, chosen, concurrency_value, delay_value, retries_value,
-                api_confirmed, replace, url, workflow, failed_index,
+                api_confirmed, replace, url, workflow, positive_prompt,
+                negative_prompt, failed_index,
             ) = values
             try:
                 return start_generation(
@@ -836,6 +911,7 @@ def build_ui():
                     "Selected scenes", [failed_index] if failed_index else [],
                     concurrency_value, delay_value, retries_value,
                     api_confirmed, replace, url, workflow,
+                    positive_prompt, negative_prompt,
                 )
             except Exception as exc:
                 return f"**Could not retry scene:** {exc}"

@@ -53,6 +53,9 @@ ComfyUI server or **api** for Gemini. API generation requires an explicit
 confirmation in the UI. Jobs run in a background worker; cancellation stops
 queued scenes and waits for active backend calls to finish. Non-secret UI
 preferences are saved to the current user's Narrato settings directory.
+Studio callbacks are exposed in API docs; gallery and file payload schemas are
+excluded because they contain JSON Schema boolean forms unsupported by the
+project's pinned Gradio client.
 
 The **Check backend readiness** button performs ComfyUI connectivity, workflow,
 and model checks for local generation. For Gemini it only verifies local
@@ -98,12 +101,15 @@ private; `IMAGE_BACKEND` selects exactly one backend and generation errors do
 not trigger a fallback.
 
 ```
-IMAGE_BACKEND=mock           # mock | api | local
+IMAGE_BACKEND=local          # mock | api | local
 GEMINI_API_KEY=...           # only needed for api
 GEMINI_IMAGE_MODEL=gemini-nano-banana-2.1
 COMFYUI_URL=http://127.0.0.1:8188
-COMFYUI_WORKFLOW=C:\path\to\workflow_api.json
-COMFYUI_MODEL=               # optional model override for a single loader node
+COMFYUI_WORKFLOW=C:\path\to\workflow_api.json  # set to your exported workflow
+COMFYUI_MODEL=v1-5-pruned-emaonly.safetensors  # optional single-loader override
+# Optional only when workflow node detection is ambiguous:
+COMFYUI_POSITIVE_NODE_ID=
+COMFYUI_NEGATIVE_NODE_ID=
 ```
 
 `COMFYUI_BASE_URL` remains supported as a compatibility alias when
@@ -115,15 +121,28 @@ logged or placed in frontend code. No API request is made by setup, dry-run,
 or tests.
 
 For the local backend, start ComfyUI yourself and export a workflow in **API
-format**. Put `{{prompt}}` in the positive text input. The workflow must
+format** (in ComfyUI, use **Save (API Format)**). Put `{{prompt}}` in the
+positive `CLIPTextEncode` text input and `{{negative_prompt}}` in the negative
+one. Alternatively, Narrato detects the text nodes connected to the sampler's
+`positive` and `negative` inputs. If either is ambiguous, set
+`COMFYUI_POSITIVE_NODE_ID` or `COMFYUI_NEGATIVE_NODE_ID` to that workflow's
+node ID; the Studio readiness check validates the choice. The workflow must
 include a `SaveImage` node and one supported model loader
 (`CheckpointLoaderSimple`, `CheckpointLoader`, or `UNETLoader`). Before
 submitting a job, the backend checks ComfyUI connectivity, workflow node
 availability, and the selected checkpoint/diffusion model. Aspect ratios are
-applied to supported empty-latent nodes. Use `COMFYUI_MODEL` only when the
-workflow has exactly one supported model loader. Models and ComfyUI are
-installed and managed separately; the application does not download models
-or assume any particular GPU/VRAM capacity.
+applied to supported empty-latent nodes only when selected; **Workflow
+dimensions** preserves the exported width/height and all checkpoint, sampler,
+scheduler, steps, CFG, and seed settings. An explicit 3:2 override uses
+768 × 512. Use `COMFYUI_MODEL` only when the workflow has exactly one supported
+model loader. Models and ComfyUI are installed and managed separately; the
+application does not download models or assume any particular GPU/VRAM capacity.
+
+Narrato composes the scene prompt with reusable cinematic positive and negative
+quality prompts. These are editable in Studio and saved with the other
+non-secret Studio settings. Effective prompts are recorded in
+`image_manifest.json`. Gemini receives negative guidance as text; ComfyUI
+workflows use a dedicated negative text node.
 
 The mock backend writes clearly labeled PNGs that are not AI-generated.
 All backends use stable scene filenames, a resumable manifest, bounded retries,
@@ -136,9 +155,20 @@ One-image commands (replace paths/settings as needed):
 # First configure GEMINI_API_KEY in .env. This explicitly makes one real API request.
 python -m ai_visualizer generate-images --plan scene_plan.json --output outputs/api_pilot --manifest outputs/api_pilot_manifest.json --backend api --scenes 1 --force --retries 0
 
-# Configure a reachable ComfyUI server and API-format workflow in .env first.
-python -m ai_visualizer generate-images --plan scene_plan.json --output outputs/local_pilot --manifest outputs/local_pilot_manifest.json --backend local --scenes 1 --force --retries 0
+# Configure COMFYUI_URL and the actual exported COMFYUI_WORKFLOW path first.
+python -m ai_visualizer generate-images --plan scene_plan.json --output outputs/local_pilot --manifest outputs/local_pilot_manifest.json --backend local --scenes 1 --retries 0
 ```
+
+From PowerShell, launch Studio with:
+
+```powershell
+Set-Location 'C:\Users\Anish\Desktop\AI visualizer'
+python -m ai_visualizer ui
+```
+
+Select **Selected scenes**, choose one scene for a pilot, run **Check backend
+readiness**, then start generation. Existing images are not overwritten unless
+**Explicitly replace existing output files** is checked.
 
 ## Testing
 

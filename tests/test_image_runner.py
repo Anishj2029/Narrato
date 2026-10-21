@@ -300,7 +300,9 @@ class TestSuccessfulGeneration:
         assert len(manifest) == 2
         assert all(e["status"] == "ok" for e in manifest)
         assert manifest[0]["scene_id"] == "1"
-        assert manifest[0]["prompt"] == "Cinematic bridge at sunset, warm light."
+        assert manifest[0]["prompt"].endswith("Cinematic bridge at sunset, warm light")
+        assert manifest[0]["prompt"].count("Cinematic film still") == 1
+        assert manifest[0]["negative_prompt_used"]
         assert manifest[0]["path"] == manifest[0]["image_path"]
         assert manifest[0]["model"] == "mock-labeled-png-v1"
 
@@ -487,7 +489,65 @@ class TestSuccessfulGeneration:
             results = run_image_generation(cfg)
 
         assert not results[0].prompt_used.startswith("[FALLBACK]")
-        assert results[0].prompt_used == "Some fallback text here."
+        assert results[0].prompt_used.endswith("Some fallback text here")
+        assert results[0].prompt_used.count("Cinematic film still") == 1
+
+    def test_quality_prompts_are_composed_once_on_retry_and_resume(
+        self, tmp_path
+    ):
+        from PIL import Image
+
+        scene = _make_scene(image_prompt="Clear subject, detailed house.")
+        scene["negative_prompt"] = "Blurry, malformed hands."
+        plan = tmp_path / "plan.json"
+        _write_plan([scene], plan)
+        calls = []
+
+        class RetryBackend:
+            name = "local"
+            model_identifier = "test-model"
+
+            def generate(self, scene_id, image_prompt, output_path, options):
+                calls.append((image_prompt, options.negative_prompt))
+                if len(calls) == 1:
+                    return GenerationResult(None, "local", self.model_identifier, False, "retry")
+                Image.new("RGB", (2, 2)).save(output_path, format="PNG")
+                return GenerationResult(
+                    output_path, "local", self.model_identifier, True
+                )
+
+        config = RunConfig(
+            scene_plan_path=plan,
+            output_dir=tmp_path / "images",
+            manifest_path=tmp_path / "manifest.json",
+            backend="local",
+            backend_instance=RetryBackend(),
+            max_retries=1,
+            retry_delay_seconds=0,
+            delay_seconds=0,
+            positive_quality_prompt="Film look, clear subject.",
+            negative_quality_prompt="Blurry, image noise.",
+        )
+        first_results = run_image_generation(config)
+
+        expected_positive = "Film look, clear subject, detailed house"
+        expected_negative = "Blurry, image noise, malformed hands"
+        assert first_results[0].status == "ok"
+        assert calls == [
+            (expected_positive, expected_negative),
+            (expected_positive, expected_negative),
+        ]
+        manifest_entry = json.loads(
+            config.manifest_path.read_text(encoding="utf-8")
+        )[0]
+        assert manifest_entry["prompt_used"] == expected_positive
+        assert manifest_entry["negative_prompt_used"] == expected_negative
+
+        resumed = run_image_generation(config)
+        assert resumed[0].status == "skipped"
+        assert resumed[0].prompt_used == expected_positive
+        assert resumed[0].negative_prompt_used == expected_negative
+        assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------

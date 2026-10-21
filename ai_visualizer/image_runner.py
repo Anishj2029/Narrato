@@ -56,6 +56,11 @@ from .image_backends import (
     create_backend,
     validate_options,
 )
+from .image_prompts import (
+    DEFAULT_NEGATIVE_PROMPT,
+    DEFAULT_POSITIVE_PROMPT,
+    compose_prompt,
+)
 
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
@@ -81,6 +86,7 @@ class SceneResult:
     backend: str = ""
     is_placeholder: bool = False
     model: str = ""
+    negative_prompt_used: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -155,6 +161,8 @@ def validate_scene_plan(scenes: Any) -> List[str]:
         for field_name in ("title", "text", "image_prompt"):
             if field_name in s and not isinstance(s[field_name], str):
                 errors.append(f"{loc}: {field_name} must be a string")
+        if "negative_prompt" in s and not isinstance(s["negative_prompt"], str):
+            errors.append(f"{loc}: negative_prompt must be a string")
 
         st = s.get("start_time")
         et = s.get("end_time")
@@ -251,7 +259,14 @@ def _backend_stability(scene: Dict[str, Any], out_dir: Path) -> Path:
         "Accept": "application/json",
     }
     payload = {
-        "text_prompts": [{"text": prompt, "weight": 1.0}],
+        "text_prompts": [
+            {"text": prompt, "weight": 1.0},
+            *(
+                [{"text": scene["negative_prompt"], "weight": -1.0}]
+                if scene.get("negative_prompt")
+                else []
+            ),
+        ],
         "cfg_scale": 7,
         "height": 576,
         "width": 1024,
@@ -283,7 +298,12 @@ def _backend_replicate(scene: Dict[str, Any], out_dir: Path) -> Path:
     os.environ["REPLICATE_API_TOKEN"] = token
     output = replicate.run(
         "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
-        input={"prompt": prompt, "width": 1024, "height": 576},
+        input={
+            "prompt": prompt,
+            "negative_prompt": scene.get("negative_prompt", ""),
+            "width": 1024,
+            "height": 576,
+        },
     )
     image_url = output[0] if isinstance(output, list) else output
     resp = requests.get(image_url, timeout=90)
@@ -364,7 +384,9 @@ class RunConfig:
     force: bool = False          # ignore skip_existing
     dry_run: bool = False        # validate only, no API calls
     scene_indexes: Optional[List[int]] = None  # None = all scenes
-    aspect_ratio: Optional[str] = "16:9"
+    aspect_ratio: Optional[str] = None
+    positive_quality_prompt: str = DEFAULT_POSITIVE_PROMPT
+    negative_quality_prompt: str = DEFAULT_NEGATIVE_PROMPT
     concurrency: int = 1
     cancel_event: Optional[Event] = None
     progress_callback: Optional[
@@ -435,6 +457,7 @@ def _generate_one(
     scene: Dict[str, Any],
     filename: str,
     prompt: str,
+    negative_prompt: str,
     backend_name: str,
     backend_fn: BackendFn,
     backend_instance: Any,
@@ -452,7 +475,8 @@ def _generate_one(
                 raise ValueError("image_prompt is empty")
             if backend_instance is not None:
                 generated = backend_instance.generate(
-                    str(index), prompt, output_path, options
+                    str(index), prompt, output_path,
+                    ImageOptions(options.aspect_ratio, negative_prompt),
                 )
                 if not generated.success or generated.output_path is None:
                     raise RuntimeError(generated.error or "Backend returned no output image.")
@@ -460,14 +484,18 @@ def _generate_one(
                 model = generated.model_identifier
             elif backend_name == "mock" and backend_fn is _DEFAULT_MOCK_BACKEND:
                 generated = MockBackend().generate(
-                    str(index), prompt, output_path, options
+                    str(index), prompt, output_path,
+                    ImageOptions(options.aspect_ratio, negative_prompt),
                 )
                 if not generated.success or generated.output_path is None:
                     raise RuntimeError(generated.error or "Mock backend returned no output image.")
                 saved_path = generated.output_path
                 model = generated.model_identifier
             else:
-                saved_path = backend_fn(scene, output_dir)
+                backend_scene = dict(scene)
+                backend_scene["image_prompt"] = prompt
+                backend_scene["negative_prompt"] = negative_prompt
+                saved_path = backend_fn(backend_scene, output_dir)
                 model = ""
             saved_path = Path(saved_path)
             if not saved_path.is_file():
@@ -483,6 +511,7 @@ def _generate_one(
                 image_path=str(saved_path), prompt_used=prompt, status="ok",
                 backend=backend_name, is_placeholder=backend_name in {"mock", "placeholder"},
                 model=model,
+                negative_prompt_used=negative_prompt,
             )
         except Exception as exc:
             last_error = str(exc)
@@ -497,6 +526,7 @@ def _generate_one(
         image_path="", prompt_used=prompt, status="error", error=last_error,
         backend=backend_name, is_placeholder=backend_name in {"mock", "placeholder"},
         model=getattr(backend_instance, "model_identifier", ""),
+        negative_prompt_used=negative_prompt,
     )
 
 
@@ -549,9 +579,12 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
         raise ValueError("concurrency must be between 1 and 8.")
     if cfg.delay_seconds < 0 or cfg.retry_delay_seconds < 0:
         raise ValueError("delay values must not be negative.")
-    options = ImageOptions(aspect_ratio=cfg.aspect_ratio)
+    aspect_ratio = cfg.aspect_ratio
+    if backend_name != "local" and aspect_ratio is None:
+        aspect_ratio = "16:9"
+    options = ImageOptions(aspect_ratio=aspect_ratio)
     validate_options(options)
-    if backend_name in {"stability", "replicate"} and cfg.aspect_ratio != "16:9":
+    if backend_name in {"stability", "replicate"} and aspect_ratio != "16:9":
         raise BackendConfigurationError(
             f"Backend {backend_name!r} only supports the existing 16:9 image dimensions."
         )
@@ -580,7 +613,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
         print("-" * 100)
 
     # ── Process each scene ────────────────────────────────────────────────
-    pending: List[tuple[Dict[str, Any], str, str]] = []
+    pending: List[tuple[Dict[str, Any], str, str, str]] = []
     conflicts: List[SceneResult] = []
     completed_count = 0
 
@@ -597,7 +630,16 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
         suggested_name = scene.get("filename_suggestion") or f"scene_{idx:03d}.png"
         fname = Path(suggested_name).with_suffix(output_extension).name
         raw_prompt = scene.get("image_prompt", "").strip()
-        clean = _clean_prompt(raw_prompt)
+        scene_prompt = _clean_prompt(raw_prompt)
+        clean = (
+            compose_prompt(cfg.positive_quality_prompt, scene_prompt)
+            if scene_prompt
+            else ""
+        )
+        negative_prompt = compose_prompt(
+            cfg.negative_quality_prompt,
+            _clean_prompt(scene.get("negative_prompt", "")),
+        )
         out_path = cfg.output_dir / fname
 
         # ── Dry-run ───────────────────────────────────────────────────────
@@ -612,6 +654,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 status="dry_run", backend=backend_name,
                 is_placeholder=backend_name in {"mock", "placeholder"},
                 model=getattr(backend_instance, "model_identifier", ""),
+                negative_prompt_used=negative_prompt,
             ))
             notify_complete(results[-1])
             continue
@@ -633,6 +676,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 status="skipped", backend=prev.backend,
                 is_placeholder=prev.is_placeholder,
                 model=prev.model,
+                negative_prompt_used=prev.negative_prompt_used,
             ))
             notify_complete(results[-1])
             continue
@@ -646,6 +690,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 image_path=str(out_path), prompt_used=clean,
                 status="skipped", backend="unknown",
                 is_placeholder=False, model="unknown",
+                negative_prompt_used=negative_prompt,
             ))
             save_manifest(results + [existing[k] for k in existing
                                      if k not in {r.index for r in results}],
@@ -668,9 +713,10 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 ),
                 backend=backend_name,
                 model="",
+                negative_prompt_used=negative_prompt,
             ))
             continue
-        pending.append((scene, fname, clean))
+        pending.append((scene, fname, clean, negative_prompt))
 
     if pending or conflicts:
         if backend_instance is None and backend_name in {"api", "local"}:
@@ -709,11 +755,11 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                                 return False
                         else:
                             time.sleep(cfg.delay_seconds)
-                    scene, filename, prompt = pending[next_job]
+                    scene, filename, prompt, negative_prompt = pending[next_job]
                     next_job += 1
                     future = executor.submit(
                         _generate_one,
-                        scene, filename, prompt, backend_name, backend_fn,
+                        scene, filename, prompt, negative_prompt, backend_name, backend_fn,
                         backend_instance, cfg.output_dir, options, cfg.max_retries,
                         cfg.retry_delay_seconds,
                     )
@@ -741,7 +787,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                         continue
 
                 if cfg.cancel_event and cfg.cancel_event.is_set():
-                    for scene, filename, prompt in pending[next_job:]:
+                    for scene, filename, prompt, negative_prompt in pending[next_job:]:
                         persist_result(SceneResult(
                             index=scene["index"],
                             title=scene["title"],
@@ -753,6 +799,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                             backend=backend_name,
                             is_placeholder=backend_name in {"mock", "placeholder"},
                             model=getattr(backend_instance, "model_identifier", ""),
+                            negative_prompt_used=negative_prompt,
                         ))
 
         for conflict in conflicts:

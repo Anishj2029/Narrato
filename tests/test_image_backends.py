@@ -66,14 +66,30 @@ def _workflow(path: Path) -> Path:
             "class_type": "CheckpointLoaderSimple",
             "inputs": {"ckpt_name": "test.safetensors"},
         },
-        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}"}},
-        "3": {
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}"},
+              },
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": "{{negative_prompt}}"}},
+        "4": {
             "class_type": "EmptyLatentImage",
             "inputs": {"width": 512, "height": 512, "batch_size": 1},
         },
-        "4": {
+        "5": {
             "class_type": "SaveImage",
             "inputs": {"filename_prefix": "{{filename_prefix}}"},
+        },
+        "6": {
+            "class_type": "KSampler",
+            "inputs": {
+                "positive": ["2", 0],
+                "negative": ["3", 0],
+                "seed": 123,
+                "steps": 28,
+                "cfg": 6.5,
+                "sampler_name": "dpmpp_2m",
+                "scheduler": "karras",
+                "denoise": 1.0,
+            },
         },
     }
     path.write_text(json.dumps(data), encoding="utf-8")
@@ -281,6 +297,7 @@ def test_local_backend_preflights_submits_polls_and_downloads(tmp_path):
         "CLIPTextEncode": {},
         "EmptyLatentImage": {},
         "SaveImage": {},
+        "KSampler": {},
     }
 
     def fake_get(url, **kwargs):
@@ -309,7 +326,9 @@ def test_local_backend_preflights_submits_polls_and_downloads(tmp_path):
             poll_interval=0.001,
         )
         path = tmp_path / "scene_001.png"
-        result = backend.generate("1", "A quiet harbor", path, ImageOptions("16:9"))
+        result = backend.generate(
+            "1", "A quiet harbor", path, ImageOptions("3:2", "malformed hands")
+        )
 
     assert result.success
     assert result.backend_name == "local"
@@ -317,9 +336,16 @@ def test_local_backend_preflights_submits_polls_and_downloads(tmp_path):
     assert path.read_bytes() == png
     submitted = post.call_args.kwargs["json"]["prompt"]
     assert submitted["2"]["inputs"]["text"] == "A quiet harbor"
-    assert submitted["3"]["inputs"]["width"] == 1024
-    assert submitted["3"]["inputs"]["height"] == 576
-    assert submitted["4"]["inputs"]["filename_prefix"] == "sceneflow_1"
+    assert submitted["3"]["inputs"]["text"] == "malformed hands"
+    assert submitted["4"]["inputs"]["width"] == 768
+    assert submitted["4"]["inputs"]["height"] == 512
+    assert submitted["5"]["inputs"]["filename_prefix"] == "narrato_1"
+    assert submitted["6"]["inputs"]["seed"] == 123
+    assert submitted["6"]["inputs"]["steps"] == 28
+    assert submitted["6"]["inputs"]["cfg"] == 6.5
+    assert submitted["6"]["inputs"]["sampler_name"] == "dpmpp_2m"
+    assert submitted["6"]["inputs"]["scheduler"] == "karras"
+    assert submitted["6"]["inputs"]["denoise"] == 1.0
 
 
 def test_local_backend_rejects_unavailable_model_before_submission(tmp_path):
@@ -332,6 +358,7 @@ def test_local_backend_rejects_unavailable_model_before_submission(tmp_path):
                 "CLIPTextEncode": {},
                 "EmptyLatentImage": {},
                 "SaveImage": {},
+                "KSampler": {},
             }),
             _Response([]),
         ]
@@ -344,6 +371,7 @@ def test_local_backend_requires_prompt_placeholder(tmp_path):
     workflow_path = _workflow(tmp_path / "workflow.json")
     data = json.loads(workflow_path.read_text(encoding="utf-8"))
     data["2"]["inputs"]["text"] = "fixed prompt"
+    data["6"]["inputs"]["positive"] = ["1", 0]
     workflow_path.write_text(json.dumps(data), encoding="utf-8")
     with patch("ai_visualizer.image_backends.requests.get") as get:
         get.side_effect = [
@@ -353,11 +381,80 @@ def test_local_backend_requires_prompt_placeholder(tmp_path):
                 "CLIPTextEncode": {},
                 "EmptyLatentImage": {},
                 "SaveImage": {},
+                "KSampler": {},
             }),
         ]
         backend = ComfyUIBackend(workflow_path=workflow_path)
         with pytest.raises(BackendConfigurationError, match=r"\{\{prompt\}\}"):
             backend.preflight()
+
+
+def test_local_backend_detects_text_nodes_from_sampler_connections(tmp_path):
+    workflow_path = _workflow(tmp_path / "workflow.json")
+    data = json.loads(workflow_path.read_text(encoding="utf-8"))
+    data["2"]["inputs"]["text"] = "positive text"
+    data["3"]["inputs"]["text"] = "negative text"
+    workflow_path.write_text(json.dumps(data), encoding="utf-8")
+
+    backend = ComfyUIBackend(workflow_path=workflow_path)
+
+    assert backend._text_node_id("positive") == "2"
+    assert backend._text_node_id("negative") == "3"
+
+
+def test_local_backend_validates_explicit_prompt_node_ids(tmp_path):
+    workflow_path = _workflow(tmp_path / "workflow.json")
+    backend = ComfyUIBackend(
+        workflow_path=workflow_path,
+        negative_node_id="missing",
+    )
+
+    with pytest.raises(ValueError, match="negative text node"):
+        backend._text_node_id("negative")
+
+
+def test_local_backend_preserves_workflow_latent_dimensions(tmp_path):
+    workflow_path = _workflow(tmp_path / "workflow.json")
+    png = _png_bytes()
+    object_info = {
+        "CheckpointLoaderSimple": {},
+        "CLIPTextEncode": {},
+        "EmptyLatentImage": {},
+        "SaveImage": {},
+        "KSampler": {},
+    }
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/system_stats"):
+            return _Response({})
+        if url.endswith("/object_info"):
+            return _Response(object_info)
+        if url.endswith("/models/checkpoints"):
+            return _Response(["test.safetensors"])
+        if url.endswith("/history/job-1"):
+            return _Response({"job-1": {"outputs": {
+                "4": {"images": [{"filename": "generated.png", "type": "output"}]},
+            }}})
+        if url.endswith("/view"):
+            return _Response(content=png)
+        raise AssertionError(f"Unexpected GET {url}")
+
+    with patch("ai_visualizer.image_backends.requests.get", side_effect=fake_get), patch(
+        "ai_visualizer.image_backends.requests.post",
+        return_value=_Response({"prompt_id": "job-1"}),
+    ) as post:
+        backend = ComfyUIBackend(
+            workflow_path=workflow_path,
+            poll_interval=0.001,
+        )
+        result = backend.generate(
+            "1", "A quiet harbor", tmp_path / "scene_001.png", ImageOptions()
+        )
+
+    assert result.success
+    submitted = post.call_args.kwargs["json"]["prompt"]
+    assert submitted["4"]["inputs"]["width"] == 512
+    assert submitted["4"]["inputs"]["height"] == 512
 
 
 def test_local_backend_reports_job_timeout(tmp_path):
@@ -367,6 +464,7 @@ def test_local_backend_reports_job_timeout(tmp_path):
         "CLIPTextEncode": {},
         "EmptyLatentImage": {},
         "SaveImage": {},
+        "KSampler": {},
     }
 
     def fake_get(url, **kwargs):
@@ -402,6 +500,14 @@ def test_local_backend_requires_workflow_configuration(monkeypatch):
         create_backend("local")
 
 
+def test_local_backend_rejects_invalid_workflow_json(tmp_path):
+    workflow_path = tmp_path / "workflow.json"
+    workflow_path.write_text("{invalid json", encoding="utf-8")
+
+    with pytest.raises(BackendConfigurationError, match="Could not read ComfyUI workflow"):
+        ComfyUIBackend(workflow_path=workflow_path)
+
+
 def test_local_backend_prefers_comfyui_url_and_supports_legacy_name(
     monkeypatch, tmp_path
 ):
@@ -417,3 +523,12 @@ def test_local_backend_prefers_comfyui_url_and_supports_legacy_name(
 
     monkeypatch.delenv("COMFYUI_URL")
     assert create_backend("local").base_url == "http://legacy:8188/"
+
+
+def test_local_backend_defaults_to_loopback_url(monkeypatch, tmp_path):
+    workflow_path = _workflow(tmp_path / "workflow.json")
+    monkeypatch.setenv("COMFYUI_WORKFLOW", str(workflow_path))
+    monkeypatch.delenv("COMFYUI_URL", raising=False)
+    monkeypatch.delenv("COMFYUI_BASE_URL", raising=False)
+
+    assert create_backend("local").base_url == "http://127.0.0.1:8188/"

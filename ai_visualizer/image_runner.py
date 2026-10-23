@@ -59,6 +59,8 @@ from .image_backends import (
 from .image_prompts import (
     DEFAULT_NEGATIVE_PROMPT,
     DEFAULT_POSITIVE_PROMPT,
+    DEFAULT_THEME,
+    get_theme_prompts,
     compose_prompt,
 )
 
@@ -87,6 +89,7 @@ class SceneResult:
     is_placeholder: bool = False
     model: str = ""
     negative_prompt_used: str = ""
+    theme: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -387,6 +390,7 @@ class RunConfig:
     aspect_ratio: Optional[str] = None
     positive_quality_prompt: str = DEFAULT_POSITIVE_PROMPT
     negative_quality_prompt: str = DEFAULT_NEGATIVE_PROMPT
+    theme: str = DEFAULT_THEME
     concurrency: int = 1
     cancel_event: Optional[Event] = None
     progress_callback: Optional[
@@ -465,6 +469,7 @@ def _generate_one(
     options: ImageOptions,
     max_retries: int,
     retry_delay_seconds: float,
+    cfg_theme: str = "",
 ) -> SceneResult:
     index = scene["index"]
     output_path = output_dir / filename
@@ -512,6 +517,7 @@ def _generate_one(
                 backend=backend_name, is_placeholder=backend_name in {"mock", "placeholder"},
                 model=model,
                 negative_prompt_used=negative_prompt,
+                theme=cfg_theme,
             )
         except Exception as exc:
             last_error = str(exc)
@@ -527,6 +533,7 @@ def _generate_one(
         backend=backend_name, is_placeholder=backend_name in {"mock", "placeholder"},
         model=getattr(backend_instance, "model_identifier", ""),
         negative_prompt_used=negative_prompt,
+        theme=cfg_theme,
     )
 
 
@@ -593,6 +600,13 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
     output_extension = ".jpg" if backend_name == "api" else ".png"
     backend_instance = cfg.backend_instance
 
+    cfg.theme = cfg.theme or DEFAULT_THEME
+    theme_positive, theme_negative = get_theme_prompts(cfg.theme)
+    if cfg.positive_quality_prompt == DEFAULT_POSITIVE_PROMPT and cfg.theme != DEFAULT_THEME:
+        cfg.positive_quality_prompt = theme_positive
+    if cfg.negative_quality_prompt == DEFAULT_NEGATIVE_PROMPT and cfg.theme != DEFAULT_THEME:
+        cfg.negative_quality_prompt = theme_negative
+
     # ── Setup output dir ──────────────────────────────────────────────────
     if not cfg.dry_run:
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -655,6 +669,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 is_placeholder=backend_name in {"mock", "placeholder"},
                 model=getattr(backend_instance, "model_identifier", ""),
                 negative_prompt_used=negative_prompt,
+                theme=cfg.theme,
             ))
             notify_complete(results[-1])
             continue
@@ -677,6 +692,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 is_placeholder=prev.is_placeholder,
                 model=prev.model,
                 negative_prompt_used=prev.negative_prompt_used,
+                theme=prev.theme or cfg.theme,
             ))
             notify_complete(results[-1])
             continue
@@ -691,6 +707,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 status="skipped", backend="unknown",
                 is_placeholder=False, model="unknown",
                 negative_prompt_used=negative_prompt,
+                theme=cfg.theme,
             ))
             save_manifest(results + [existing[k] for k in existing
                                      if k not in {r.index for r in results}],
@@ -714,6 +731,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                 backend=backend_name,
                 model="",
                 negative_prompt_used=negative_prompt,
+                theme=cfg.theme,
             ))
             continue
         pending.append((scene, fname, clean, negative_prompt))
@@ -761,7 +779,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                         _generate_one,
                         scene, filename, prompt, negative_prompt, backend_name, backend_fn,
                         backend_instance, cfg.output_dir, options, cfg.max_retries,
-                        cfg.retry_delay_seconds,
+                        cfg.retry_delay_seconds, cfg.theme,
                     )
                     futures[future] = scene["index"]
                     if cfg.progress_callback:
@@ -800,6 +818,7 @@ def run_image_generation(cfg: RunConfig) -> List[SceneResult]:
                             is_placeholder=backend_name in {"mock", "placeholder"},
                             model=getattr(backend_instance, "model_identifier", ""),
                             negative_prompt_used=negative_prompt,
+                            theme=cfg.theme,
                         ))
 
         for conflict in conflicts:

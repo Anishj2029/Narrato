@@ -8,6 +8,11 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from ai_visualizer.image_prompts import (
+    CINEMATIC_CONCEPT_ART_NEGATIVE,
+    CINEMATIC_CONCEPT_ART_POSITIVE,
+    DEFAULT_THEME,
+)
 from ai_visualizer.image_runner import SceneResult, save_manifest
 from ai_visualizer import studio
 
@@ -80,6 +85,19 @@ def test_settings_persist_non_secret_fields_only(tmp_path):
     assert stored["selected_scenes"] == ["1", "3"]
     assert loaded.positive_quality_prompt == "Film look"
     assert loaded.negative_quality_prompt == "Blurry"
+
+
+def test_settings_without_theme_load_with_default_theme(tmp_path):
+    path = tmp_path / "older-studio.json"
+    path.write_text(
+        json.dumps({"backend": "api", "positive_quality_prompt": "Film look"}),
+        encoding="utf-8",
+    )
+
+    settings = studio.load_settings(path)
+
+    assert settings.theme == DEFAULT_THEME
+    assert settings.positive_quality_prompt == "Film look"
 
 
 def test_workflow_dimensions_are_a_valid_studio_setting():
@@ -246,8 +264,8 @@ def test_studio_api_info_excludes_filedata_schemas_without_hiding_callbacks():
     assert len(
         api_info["named_endpoints"]["/refresh_dashboard"]["returns"]
     ) == 7
-    assert len(api_info["named_endpoints"]["/start_handler"]["parameters"]) == 16
-    assert len(api_info["named_endpoints"]["/retry_one"]["parameters"]) == 17
+    assert len(api_info["named_endpoints"]["/start_handler"]["parameters"]) == 17
+    assert len(api_info["named_endpoints"]["/retry_one"]["parameters"]) == 18
     assert len(api_info["named_endpoints"]["/continuous_coro"]["parameters"]) == 3
     assert all(
         dep["show_api"]
@@ -260,12 +278,13 @@ def test_studio_event_callback_arities_match_registered_dependencies():
     expected_counts = {
         "backend_visibility": (1, 3),
         "lambda": (1, 1),
+        "apply_theme": (4, 3),
         "refresh_dashboard": (3, 10),
         "check_backend_readiness": (3, 1),
-        "start_handler": (16, 1),
+        "start_handler": (17, 1),
         "refresh_dashboard_1": (3, 10),
         "cancel_generation": (0, 1),
-        "retry_one": (17, 1),
+        "retry_one": (18, 1),
         "continuous_coro": (3, 10),
     }
 
@@ -321,6 +340,7 @@ def test_start_and_retry_callbacks_forward_all_registered_inputs(monkeypatch):
         "workflow.json",
         "positive prompt",
         "negative prompt",
+        "Cinematic Concept Art",
     ]
 
     assert callbacks["start_handler"](*start_values) == "Started"
@@ -331,6 +351,37 @@ def test_start_and_retry_callbacks_forward_all_registered_inputs(monkeypatch):
     retry_values[5] = "Selected scenes"
     retry_values[6] = ["7"]
     assert calls[-1] == tuple(retry_values)
+
+
+def test_theme_change_updates_theme_defaults_but_preserves_prompt_edits():
+    app = studio.build_ui()
+    callback = next(
+        callback.fn
+        for dependency, callback in zip(app.config["dependencies"], app.fns)
+        if dependency["api_name"] == "apply_theme"
+    )
+
+    positive, negative, theme = callback(
+        "Cinematic Concept Art",
+        studio.DEFAULT_POSITIVE_PROMPT,
+        studio.DEFAULT_NEGATIVE_PROMPT,
+        DEFAULT_THEME,
+    )
+
+    assert positive == CINEMATIC_CONCEPT_ART_POSITIVE
+    assert negative == CINEMATIC_CONCEPT_ART_NEGATIVE
+    assert theme == "Cinematic Concept Art"
+
+    positive, negative, theme = callback(
+        DEFAULT_THEME,
+        "My edited positive prompt",
+        CINEMATIC_CONCEPT_ART_NEGATIVE,
+        "Cinematic Concept Art",
+    )
+
+    assert positive == "My edited positive prompt"
+    assert negative == studio.DEFAULT_NEGATIVE_PROMPT
+    assert theme == DEFAULT_THEME
 
 
 def test_dashboard_uses_manifest_statuses_and_handles_invalid_preview(tmp_path):
@@ -463,7 +514,8 @@ def test_start_generation_runs_in_background_and_reports_status(
             pass
 
     monkeypatch.setattr(studio, "ComfyUIBackend", LocalBackend)
-    monkeypatch.setattr(studio, "save_settings", lambda settings: None)
+    saved_settings = []
+    monkeypatch.setattr(studio, "save_settings", saved_settings.append)
 
     received_configs = []
 
@@ -495,6 +547,7 @@ def test_start_generation_runs_in_background_and_reports_status(
         str(workflow),
         "Film look",
         "No artifacts",
+        "Cinematic Concept Art",
     )
     worker = studio._JOB["thread"]
     worker.join(timeout=2)
@@ -507,6 +560,8 @@ def test_start_generation_runs_in_background_and_reports_status(
     assert snapshot["results"][0].status == "skipped"
     assert received_configs[0].positive_quality_prompt == "Film look"
     assert received_configs[0].negative_quality_prompt == "No artifacts"
+    assert received_configs[0].theme == "Cinematic Concept Art"
+    assert saved_settings[0].theme == "Cinematic Concept Art"
 
 
 def test_background_job_exception_is_exposed_as_failed_status(tmp_path, monkeypatch):
@@ -568,6 +623,20 @@ def test_api_batch_requires_confirmation_and_key(monkeypatch, tmp_path):
             str(tmp_path / "manifest.json"), "16:9", "All scenes", [],
             1, 0, 0, True, False,
         )
+
+
+def test_start_generation_rejects_unknown_theme_before_launch(tmp_path, monkeypatch):
+    plan = tmp_path / "plan.json"
+    _write_plan(plan)
+
+    with pytest.raises(ValueError, match="Unknown visual theme"):
+        studio.start_generation(
+            "api", str(plan), str(tmp_path / "images"),
+            str(tmp_path / "manifest.json"), "16:9", "All scenes", [],
+            1, 0, 0, True, False, theme="Unknown",
+        )
+
+    assert studio._JOB["status"] == "idle"
 
 
 def test_cancel_generation_requests_cooperative_cancel():

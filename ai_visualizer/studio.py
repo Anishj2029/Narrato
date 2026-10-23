@@ -29,7 +29,13 @@ from .image_runner import (
     run_image_generation,
     validate_scene_plan,
 )
-from .image_prompts import DEFAULT_NEGATIVE_PROMPT, DEFAULT_POSITIVE_PROMPT
+from .image_prompts import (
+    DEFAULT_NEGATIVE_PROMPT,
+    DEFAULT_POSITIVE_PROMPT,
+    DEFAULT_THEME,
+    get_theme_names,
+    get_theme_prompts,
+)
 
 _SETTINGS_PATH = Path(os.getenv("APPDATA", str(Path.home()))) / "Narrato" / "studio_settings.json"
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -65,6 +71,7 @@ class StudioSettings:
     retries: int = 2
     positive_quality_prompt: str = DEFAULT_POSITIVE_PROMPT
     negative_quality_prompt: str = DEFAULT_NEGATIVE_PROMPT
+    theme: str = DEFAULT_THEME
 
 
 def load_settings(path: Path = _SETTINGS_PATH) -> StudioSettings:
@@ -373,6 +380,7 @@ def start_generation(
     workflow_path: str = "",
     positive_quality_prompt: str = DEFAULT_POSITIVE_PROMPT,
     negative_quality_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+    theme: str = DEFAULT_THEME,
 ) -> str:
     """Validate and start one non-blocking image-generation job."""
     plan_path = str(_project_path(plan_path))
@@ -382,6 +390,7 @@ def start_generation(
         negative_quality_prompt, str
     ):
         raise ValueError("Quality prompts must be text.")
+    get_theme_prompts(theme)
     validate_studio_settings(
         backend,
         plan_path,
@@ -450,6 +459,7 @@ def start_generation(
         retries=int(retries),
         positive_quality_prompt=positive_quality_prompt,
         negative_quality_prompt=negative_quality_prompt,
+        theme=theme,
     )
     save_settings(settings)
 
@@ -493,6 +503,7 @@ def start_generation(
                 ),
                 positive_quality_prompt=positive_quality_prompt,
                 negative_quality_prompt=negative_quality_prompt,
+                theme=theme,
                 concurrency=int(concurrency),
                 cancel_event=cancel_event,
                 progress_callback=_progress_callback,
@@ -741,6 +752,19 @@ def build_ui():
                     value=settings.aspect_ratio,
                     label="Aspect ratio override",
                 )
+                visual_theme = gr.Dropdown(
+                    choices=get_theme_names(),
+                    value=settings.theme if settings.theme in get_theme_names() else DEFAULT_THEME,
+                    label="Visual theme",
+                    info="Select a theme to set permanent positive and negative quality prompts.",
+                )
+                previous_theme = gr.State(
+                    value=(
+                        settings.theme
+                        if settings.theme in get_theme_names()
+                        else DEFAULT_THEME
+                    )
+                )
                 positive_quality_prompt = gr.TextArea(
                     label="Permanent positive quality prompt",
                     value=settings.positive_quality_prompt,
@@ -843,6 +867,30 @@ def build_ui():
             inputs=[selection_mode],
             outputs=[selected_scenes],
         )
+
+        def apply_theme(theme_name, positive_current, negative_current, old_theme):
+            old_positive, old_negative = get_theme_prompts(old_theme)
+            positive, negative = get_theme_prompts(theme_name)
+            return (
+                positive if positive_current == old_positive else positive_current,
+                negative if negative_current == old_negative else negative_current,
+                theme_name,
+            )
+
+        visual_theme.change(
+            apply_theme,
+            inputs=[
+                visual_theme,
+                positive_quality_prompt,
+                negative_quality_prompt,
+                previous_theme,
+            ],
+            outputs=[
+                positive_quality_prompt,
+                negative_quality_prompt,
+                previous_theme,
+            ],
+        )
         refresh_btn.click(
             refresh_dashboard,
             inputs=[plan_path, output_dir, manifest_path],
@@ -874,6 +922,7 @@ def build_ui():
             workflow_path,
             positive_quality_prompt,
             negative_quality_prompt,
+            visual_theme,
         ]
 
         def start_handler(*values):
@@ -903,7 +952,7 @@ def build_ui():
                 backend_value, plan_value, output_value, manifest_value, ratio,
                 mode, chosen, concurrency_value, delay_value, retries_value,
                 api_confirmed, replace, url, workflow, positive_prompt,
-                negative_prompt, failed_index,
+                negative_prompt, theme_name, failed_index,
             ) = values
             try:
                 return start_generation(
@@ -911,7 +960,7 @@ def build_ui():
                     "Selected scenes", [failed_index] if failed_index else [],
                     concurrency_value, delay_value, retries_value,
                     api_confirmed, replace, url, workflow,
-                    positive_prompt, negative_prompt,
+                    positive_prompt, negative_prompt, theme_name,
                 )
             except Exception as exc:
                 return f"**Could not retry scene:** {exc}"

@@ -717,6 +717,7 @@ class TestFailureHandling:
         assert statuses[1] == "ok"
         assert statuses[2] == "error"
         assert statuses[3] == "ok"
+        assert all(result.theme == cfg.theme for result in results)
 
     def test_empty_prompt_is_error(self, tmp_path):
         scene = _make_scene(image_prompt="")
@@ -769,9 +770,12 @@ class TestFailureHandling:
             manifest_path=manifest_path,
             backend="local",
             delay_seconds=0,
+            theme="Cinematic Concept Art",
         ))
 
         assert results[0].status == "error"
+        assert results[0].theme == "Cinematic Concept Art"
+        assert "cinematic concept art" in results[0].prompt_used
         assert "explicitly enable replacement" in results[0].error
         assert existing_path.read_bytes() == original_bytes
         manifest_entry = json.loads(manifest_path.read_text(encoding="utf-8"))[0]
@@ -822,10 +826,13 @@ class TestRetryBehaviour:
                 cfg = RunConfig(scene_plan_path=p, output_dir=tmp_path/"img",
                                 manifest_path=tmp_path/"manifest.json",
                                 backend="always_fail", max_retries=2,
-                                retry_delay_seconds=0.0)
+                                retry_delay_seconds=0.0,
+                                theme="Cinematic Concept Art")
                 results = run_image_generation(cfg)
 
         assert results[0].status == "error"
+        assert results[0].theme == "Cinematic Concept Art"
+        assert results[0].prompt_used.count("cinematic concept art") == 1
 
     def test_cancellation_stops_scheduling_remaining_scenes(self, tmp_path):
         from threading import Event
@@ -858,6 +865,7 @@ class TestRetryBehaviour:
                 max_retries=0,
                 cancel_event=cancel_event,
                 progress_callback=progress,
+                theme="Cinematic Concept Art",
             ))
 
         assert call_log == [1]
@@ -866,6 +874,7 @@ class TestRetryBehaviour:
             2: "cancelled",
             3: "cancelled",
         }
+        assert all(result.theme == "Cinematic Concept Art" for result in results)
 
 
 # ---------------------------------------------------------------------------

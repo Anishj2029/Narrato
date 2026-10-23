@@ -58,7 +58,7 @@ _JOB: Dict[str, Any] = {
 @dataclass(frozen=True)
 class StudioSettings:
     plan_path: str = str(_PROJECT_ROOT / "scene_plan.json")
-    output_dir: str = str(_PROJECT_ROOT / "outputs" / "images")
+    output_dir: str = str(_PROJECT_ROOT / "outputs" / "images_v2")
     manifest_path: str = str(_PROJECT_ROOT / "outputs" / "image_manifest.json")
     backend: str = "local"
     comfyui_url: str = ""

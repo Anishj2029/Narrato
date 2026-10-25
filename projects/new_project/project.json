@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "audio_file": "voiceover.mp3",
+  "script_file": "script.txt",
+  "markers_file": "markers.json"
+}

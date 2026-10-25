@@ -53,9 +53,68 @@ ComfyUI server or **api** for Gemini. API generation requires an explicit
 confirmation in the UI. Jobs run in a background worker; cancellation stops
 queued scenes and waits for active backend calls to finish. Non-secret UI
 preferences are saved to the current user's Narrato settings directory.
-Studio callbacks are exposed in API docs; gallery and file payload schemas are
-excluded because they contain JSON Schema boolean forms unsupported by the
-project's pinned Gradio client.
+Existing image-generation callbacks are exposed in API docs. Gallery and file
+payload schemas are excluded because they contain JSON Schema boolean forms
+unsupported by the project's pinned Gradio client; manual project callbacks
+are UI-only.
+
+The shared **New Project** screen starts with narration audio and its script.
+It accepts readable MP3/WAV audio and a UTF-8 TXT/Markdown file or pasted script
+text; pasted text is saved as `script.txt`. Enter a project name, review the
+audio and script, create the project, then explicitly choose **Assisted Visual
+Creation** or **Automatic Visual Creation**. Projects are stored under
+`projects/<safe-project-name>/` with stable `voiceover.*` and `script.*` files,
+`project.json`, and `markers.json`. The schema-v1 project format is retained;
+new projects add optional name, creation timestamp/state, and selected-mode
+metadata, while existing projects without those fields remain loadable.
+Duplicate project folders are not overwritten. No image generation starts
+during project setup.
+
+The **Assisted Visual Creation** workspace keeps existing project loading and
+manual visual-marker tools. Load a saved project by entering its folder and
+selecting **Load saved project**. The audio player supports playback and
+scrubbing. Script paragraphs are available as navigable segments with their
+own editable marker boundaries and image prompts; prompt edits are saved to
+that segment's marker without changing unrelated markers.
+
+Segment times are proportional estimates based on script word counts, not
+word-level speech alignment. Adjust the marker boundaries while listening to
+the audio. Selecting or navigating segments, editing a prompt, and loading a
+project do not generate images. **Generate Image** and **Retry / regenerate this
+segment** run only the selected segment through the configured local ComfyUI
+workflow. The prompt is combined with Studio's quality prompts; output versions
+are stored under the project `images/` folder and the selected marker's image
+path is saved back into `markers.json`. Regeneration requires confirmation and
+creates a new version rather than overwriting the previous image. Generation
+progress and the selected segment's image preview appear in the workspace. This
+feature has unit coverage with a mocked backend; live generation still depends
+on a reachable ComfyUI service and a valid local workflow/model configuration.
+
+The **Automatic Visual Creation** workspace reuses the selected project's
+script, narration, and `markers.json`; it does not ask for the assets again.
+On entry, Narrato creates or loads a reviewable plan at
+`automatic/scene_plan.json` and associates scenes with the audio timeline using
+proportional word-count timing estimates. These are estimates, not speech
+alignment. Initial prompts are deterministic `[FALLBACK]` prompts derived from
+scene text; inspect them in the scene table. The project's existing marker
+prompts are authoritative during generation, including prompts edited in the
+Assisted workspace. Loading the project or switching modes never starts image
+generation.
+
+Review the scene text, estimated times, prompts, statuses, and existing images,
+then explicitly click **Start Automatic Generation**. Scenes are submitted
+sequentially through the existing image runner and selected backend. New images
+are saved under `automatic/images/`, with progress and results recorded in
+`automatic/image_manifest.json` and corresponding image references persisted to
+the project's existing `markers.json`; the scene gallery shows saved marker
+images alongside the scene table. Successful scenes are skipped on later
+starts unless replacement is explicitly enabled. Failed scenes can be retried
+individually. Cancellation stops queued work at a safe point; an in-progress
+backend call may finish before the worker stops. Generation requires a
+configured ComfyUI API-format workflow for local runs, or configured Gemini
+credentials and explicit confirmation for API runs. Automated tests mock
+generation; live ComfyUI generation has not been verified as part of this
+workflow.
 
 The **Check backend readiness** button performs ComfyUI connectivity, workflow,
 and model checks for local generation. For Gemini it only verifies local
@@ -137,6 +196,16 @@ scheduler, steps, CFG, and seed settings. An explicit 3:2 override uses
 768 × 512. Use `COMFYUI_MODEL` only when the workflow has exactly one supported
 model loader. Models and ComfyUI are installed and managed separately; the
 application does not download models or assume any particular GPU/VRAM capacity.
+
+For the Phase 5 validation run, the configured workflow JSON existed and was
+accepted by Narrato's configuration parser, but ComfyUI at
+`http://127.0.0.1:8188` refused the `/system_stats` preflight connection. No
+live image was generated, and workflow-node/model readiness could not be
+confirmed against the running ComfyUI service. Start ComfyUI at the configured
+`COMFYUI_URL` (or update that URL), then use **Check backend readiness**. A
+successful HTTP preflight alone does not prove image generation; verify one
+disposable scene's output image and marker/manifest persistence before relying
+on a production run.
 
 Narrato composes the scene prompt with reusable cinematic positive and negative
 quality prompts. These are editable in Studio and saved with the other

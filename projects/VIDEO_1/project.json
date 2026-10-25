@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "audio_file": "voiceover.mp3",
+  "script_file": "script.txt",
+  "markers_file": "markers.json",
+  "project_name": "VIDEO 1",
+  "creation_state": "workflow_selected",
+  "created_at": "2026-10-25T15:31:00.379178+00:00",
+  "selected_mode": "Assisted Visual Creation"
+}

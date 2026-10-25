@@ -51,6 +51,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+from .scene_parser import parse_script_text
+from .timestamp_mapper import assign_timestamps
+
 # ---------------------------------------------------------------------------
 # Configurable constants
 # ---------------------------------------------------------------------------
@@ -491,6 +494,32 @@ def plan_scenes(
         scene.filename_suggestion = f"scene_{scene.index:03d}.png"
 
     return scenes
+
+
+def plan_script_scenes(
+    script_text: str, audio_path: str | Path
+) -> List[PlannedScene]:
+    """Create an estimated-time visual plan from a Narrato project script."""
+    parsed_scenes = parse_script_text(script_text)
+    if not parsed_scenes:
+        raise ValueError("No readable script scenes were found in this project.")
+    assign_timestamps(parsed_scenes, audio_path)
+
+    planned_scenes = []
+    for scene in parsed_scenes:
+        planned = PlannedScene(
+            index=scene.index,
+            title=scene.title,
+            text=scene.text,
+            start_time=scene.start_time,
+            end_time=scene.end_time,
+            word_count=len(scene.text.split()),
+            filename_suggestion=f"scene_{scene.index:03d}.png",
+        )
+        planned.description = _fallback_description(planned)
+        planned.image_prompt = _fallback_image_prompt(planned)
+        planned_scenes.append(planned)
+    return planned_scenes
 
 
 # ---------------------------------------------------------------------------

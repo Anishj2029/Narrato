@@ -55,8 +55,9 @@ def reset_marker_job():
         thread.join(timeout=3)
 
 
-def _fake_backend(monkeypatch, result="success"):
+def _fake_backend(monkeypatch, result="success", outcomes=None):
     calls = []
+    pending_outcomes = list(outcomes or [])
 
     class FakeBackend:
         model_identifier = "test-model"
@@ -69,8 +70,9 @@ def _fake_backend(monkeypatch, result="success"):
 
         def generate(self, marker_id, prompt, output_path, options):
             calls.append(("generate", marker_id, prompt, output_path, options))
-            if result != "success":
-                return GenerationResult(None, "local", "test-model", False, result)
+            outcome = pending_outcomes.pop(0) if pending_outcomes else result
+            if outcome != "success":
+                return GenerationResult(None, "local", "test-model", False, outcome)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             Image.new("RGB", (8, 8), color=(60, 90, 70)).save(output_path)
             return GenerationResult(output_path, "local", "test-model", True)
@@ -274,6 +276,164 @@ def test_generate_targets_only_the_selected_segment_and_reloads_image(
     assert reloaded["segments"][0]["image_path"]
     assert Path(reloaded["segments"][0]["image_path"]).is_file()
     assert reloaded["segments"][1]["status"] == "No image"
+    assert reloaded["segments"][1]["marker"].image_path is None
+
+
+@pytest.mark.parametrize("selection", ["stale", "manual"])
+def test_generation_rejects_stale_or_manual_marker_ids_without_mutating_project(
+    assisted_project, monkeypatch, selection
+):
+    calls = _fake_backend(monkeypatch)
+    studio.load_assisted_workspace(assisted_project)
+    if selection == "manual":
+        selected_id = studio.add_project_marker(
+            assisted_project, 0.2, image_prompt="Manual marker prompt"
+        ).marker_id
+    else:
+        selected_id = "5e8d6d5a-01b6-4305-bf4f-7e58c1a5e57f"
+    markers_path = assisted_project / "markers.json"
+    before = markers_path.read_bytes()
+
+    response = studio.generate_assisted_segment_callback(
+        str(assisted_project),
+        selected_id,
+        0.2,
+        0.8,
+        "Must not be saved",
+        "http://127.0.0.1:8188",
+        "workflow.json",
+        "Quality",
+        "Negative",
+        False,
+        0,
+        "Workflow dimensions",
+    )
+
+    assert response[0].startswith("**Could not start image generation:**")
+    assert "Script segment not found" in response[0]
+    assert not [call for call in calls if call[0] == "generate"]
+    assert markers_path.read_bytes() == before
+
+
+def test_navigation_then_generation_targets_the_newly_selected_segment(
+    assisted_project, monkeypatch
+):
+    calls = _fake_backend(monkeypatch)
+    first, second = studio.load_assisted_workspace(assisted_project)["segments"]
+    navigation = studio.navigate_assisted_segment(
+        assisted_project, first["segment_id"], 1
+    )
+    selected_id = navigation[0]["value"]
+
+    response = studio.generate_assisted_segment_callback(
+        str(assisted_project),
+        selected_id,
+        second["marker"].start_time,
+        second["marker"].end_time,
+        "Second scene after navigation",
+        "http://127.0.0.1:8188",
+        "workflow.json",
+        "Quality",
+        "Negative",
+        False,
+        0,
+        "Workflow dimensions",
+    )
+    studio._MARKER_JOB["thread"].join(timeout=3)
+    reloaded = studio.load_assisted_workspace(assisted_project)
+    generated = [call for call in calls if call[0] == "generate"]
+
+    assert selected_id == second["segment_id"]
+    assert response[0].startswith("Started local image generation")
+    assert len(generated) == 1
+    assert generated[0][1] == second["segment_id"]
+    assert reloaded["segments"][0]["marker"].image_path is None
+    assert reloaded["segments"][1]["marker"].image_path
+    assert Path(reloaded["segments"][1]["image_path"]).is_file()
+
+
+def test_editing_prompt_then_generating_uses_that_segment_and_prompt(
+    assisted_project, monkeypatch
+):
+    calls = _fake_backend(monkeypatch)
+    first, second = studio.load_assisted_workspace(assisted_project)["segments"]
+    prompt = "Edited prompt for the first scene"
+    studio.autosave_assisted_segment_callback(
+        str(assisted_project),
+        first["segment_id"],
+        first["marker"].start_time,
+        first["marker"].end_time,
+        prompt,
+    )
+
+    response = studio.generate_assisted_segment_callback(
+        str(assisted_project),
+        first["segment_id"],
+        first["marker"].start_time,
+        first["marker"].end_time,
+        prompt,
+        "http://127.0.0.1:8188",
+        "workflow.json",
+        "Quality",
+        "Negative",
+        False,
+        0,
+        "Workflow dimensions",
+    )
+    studio._MARKER_JOB["thread"].join(timeout=3)
+    generated = [call for call in calls if call[0] == "generate"]
+    reloaded = studio.load_assisted_workspace(assisted_project)
+
+    assert response[0].startswith("Started local image generation")
+    assert len(generated) == 1
+    assert generated[0][1] == first["segment_id"]
+    assert generated[0][2].endswith(prompt)
+    assert reloaded["segments"][0]["marker"].image_prompt == prompt
+    assert reloaded["segments"][0]["marker"].image_path
+    assert reloaded["segments"][1]["marker"].image_path is None
+
+
+def test_retry_after_failed_generation_persists_image_to_same_segment(
+    assisted_project, monkeypatch
+):
+    calls = _fake_backend(
+        monkeypatch, outcomes=["ComfyUI unavailable", "success"]
+    )
+    segment = studio.load_assisted_workspace(assisted_project)["segments"][0]
+    arguments = (
+        str(assisted_project),
+        segment["segment_id"],
+        segment["marker"].start_time,
+        segment["marker"].end_time,
+        "Retry this selected scene",
+        "http://127.0.0.1:8188",
+        "workflow.json",
+        "Quality",
+        "Negative",
+        False,
+        0,
+        "Workflow dimensions",
+    )
+
+    first_response = studio.generate_assisted_segment_callback(*arguments)
+    studio._MARKER_JOB["thread"].join(timeout=3)
+    assert studio._MARKER_JOB["status"] == "failed"
+
+    retry_response = studio.generate_assisted_segment_callback(
+        *arguments, retry=True
+    )
+    studio._MARKER_JOB["thread"].join(timeout=3)
+    generated = [call for call in calls if call[0] == "generate"]
+    reloaded = studio.load_assisted_workspace(assisted_project)
+
+    assert first_response[0].startswith("Started local image generation")
+    assert retry_response[0].startswith("Started local image generation")
+    assert [call[1] for call in generated] == [
+        segment["segment_id"],
+        segment["segment_id"],
+    ]
+    assert reloaded["segments"][0]["marker"].image_path
+    assert Path(reloaded["segments"][0]["image_path"]).is_file()
     assert reloaded["segments"][1]["marker"].image_path is None
 
 

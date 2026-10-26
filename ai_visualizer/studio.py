@@ -3802,7 +3802,7 @@ def build_ui():
         )
         assisted_generation_inputs = [
             project_dir,
-            marker_selector,
+            assisted_segment_selector,
             marker_start,
             marker_end,
             marker_prompt,

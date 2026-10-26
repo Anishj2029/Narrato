@@ -791,6 +791,30 @@ def test_studio_event_callback_arities_match_registered_dependencies():
     assert actual_callbacks == expected_callbacks
 
 
+def test_assisted_generate_and_retry_use_the_script_segment_selector():
+    app = studio.build_ui()
+    component_labels = {
+        component["id"]: component["props"].get("label")
+        for component in app.config["components"]
+    }
+    generation_dependencies = [
+        dependency
+        for dependency, callback in zip(app.config["dependencies"], app.fns)
+        if callback.fn is studio.generate_assisted_segment_callback
+        or (
+            callback.fn.__name__ == "<lambda>"
+            and len(dependency["inputs"]) == 12
+            and len(dependency["outputs"]) == 5
+        )
+    ]
+
+    assert len(generation_dependencies) == 2
+    assert all(
+        component_labels[dependency["inputs"][1]] == "Script segments"
+        for dependency in generation_dependencies
+    )
+
+
 def test_automatic_start_and_retry_callbacks_forward_registered_inputs(monkeypatch):
     app = studio.build_ui()
     callbacks = {
